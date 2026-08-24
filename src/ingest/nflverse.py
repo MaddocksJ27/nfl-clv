@@ -103,11 +103,30 @@ def fetch_snap_counts(force_refresh: bool = False) -> pd.DataFrame:
     return df
 
 
+def fetch_rosters(force_refresh: bool = False) -> pd.DataFrame:
+    path = RAW_DIR / "rosters.parquet"
+
+    def _fetch():
+        # nfl_data_py 0.3.2's import_weekly_rosters raises "cannot reindex on
+        # an axis with duplicate labels" when given more than one season at
+        # once (an age-calculation bug in that library version) — fetch one
+        # season at a time and concatenate as a workaround.
+        return pd.concat(
+            [nfl.import_weekly_rosters([season]) for season in SEASONS],
+            ignore_index=True,
+        )
+
+    df = _load_or_fetch(path, _fetch, force_refresh)
+    _log_coverage("rosters", df, season_col="season")
+    return df
+
+
 def main(force_refresh: bool = False) -> None:
     fetch_schedules(force_refresh)
     fetch_pbp(force_refresh)
     fetch_injuries(force_refresh)
     fetch_snap_counts(force_refresh)
+    fetch_rosters(force_refresh)
 
 
 if __name__ == "__main__":
