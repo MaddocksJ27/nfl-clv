@@ -126,6 +126,52 @@ def resolve_player_name(raw_name: str, pool: pd.DataFrame, team_hint=None, posit
         logger.warning("AMBIGUOUS %r -> %s", raw_name, result["note"])
         return result
 
+    # Abbreviated first initial (e.g. "M. Jones Jr." -> "m jones") needs its
+    # own tier rather than the generic ratio-based fuzzy match below:
+    # dropping "Marvin" down to "m" makes "m jones" vs "marvin jones" score
+    # only 0.74 by length-sensitive ratio, while an unrelated short name like
+    # "cam jones" scores 0.88 purely by being closer in length — a real
+    # false-positive risk. Matching first-initial + exact last name directly
+    # sidesteps the ratio entirely.
+    tokens = normalized.split()
+    if len(tokens) >= 2 and len(tokens[0]) == 1:
+        initial, last = tokens[0], tokens[-1]
+        pool_tokens = pool.normalized_name.str.split()
+        initial_matches = pool[
+            pool_tokens.str[0].str[0].eq(initial) & pool_tokens.str[-1].eq(last)
+        ]
+        if len(initial_matches) == 1:
+            row = initial_matches.iloc[0]
+            result.update(status="fuzzy", player_id=row.player_id, player_name=row.player_name,
+                           team=row.team, position=row.position, method="initial + last name match")
+            logger.info("FUZZY %r -> %r (initial + last name match)", raw_name, row.player_name)
+            return result
+        if len(initial_matches) > 1:
+            narrowed = _apply_hints(initial_matches)
+            if len(narrowed) == 1:
+                row = narrowed.iloc[0]
+                result.update(status="fuzzy", player_id=row.player_id, player_name=row.player_name,
+                               team=row.team, position=row.position,
+                               method="initial + last name match, disambiguated by team/position hint")
+                return result
+            candidates = ", ".join(f"{r.player_name} ({r.team}/{r.position})" for r in initial_matches.itertuples())
+            result["status"] = "ambiguous"
+            result["note"] = f"{len(initial_matches)} initial+lastname candidates, hints did not narrow to one: {candidates}"
+            logger.warning("AMBIGUOUS %r -> %s", raw_name, result["note"])
+            return result
+        # No candidate shares this exact last name — fall through to generic
+        # fuzzy below, but stay constrained to the same first initial. Without
+        # this, a bare-initial query with no real match at all (e.g. a typo'd
+        # last name) can still fuzzy-match a wrong-initial candidate purely on
+        # ratio (this was the actual production bug: "M. Jones" ~ "Cam Jones"
+        # at 0.88 with no valid M-initial alternative in the pool).
+        pool = pool[pool_tokens.str[0].str[0].eq(initial)]
+        if pool.empty:
+            result["status"] = "unresolved"
+            result["note"] = f"no candidate with initial {initial!r} in roster pool"
+            logger.warning("UNRESOLVED %r -> no candidate with initial %r in roster pool", raw_name, initial)
+            return result
+
     # No exact match — fall back to fuzzy matching within the pool only.
     choices = pool.normalized_name.tolist()
     close = difflib.get_close_matches(normalized, choices, n=3, cutoff=FUZZY_CUTOFF)
