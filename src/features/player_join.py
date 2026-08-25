@@ -21,8 +21,17 @@ WHITESPACE_RE = re.compile(r"\s+")
 
 # Prop books list team defense and "no touchdown" as pseudo-players in some
 # markets. They will never match a roster and shouldn't be logged as if the
-# matcher failed — flag them separately.
-NON_PLAYER_RE = re.compile(r"\b(D/ST|Defense)\b$|^No Touchdown$", re.IGNORECASE)
+# matcher failed — flag them separately. Verified variants (from a 20-event
+# sample across 2023-2025): "X D/ST", "X Defense", "X Defense/Special Teams",
+# "No Touchdown", "No Scorer".
+NON_PLAYER_RE = re.compile(
+    r"\b(D/ST|Defense(/Special Teams)?)\b$|^No (Touchdown|Scorer)$", re.IGNORECASE,
+)
+
+# Some books disambiguate a common name with a parenthetical team tag, e.g.
+# "Michael Thomas (NO)" or "Michael (Saints) Thomas" — strip parentheticals
+# before normalizing so these hit the exact tier instead of relying on fuzzy.
+PARENTHETICAL_RE = re.compile(r"\([^)]*\)")
 
 FUZZY_CUTOFF = 0.82
 
@@ -32,6 +41,7 @@ def normalize_name(name: str) -> str:
     if not name:
         return ""
     name = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
+    name = PARENTHETICAL_RE.sub("", name)
     name = name.lower().replace("-", " ")
     name = PUNCTUATION_RE.sub("", name)
     name = SUFFIX_RE.sub("", name)
