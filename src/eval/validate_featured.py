@@ -132,19 +132,25 @@ def compute_consensus_home_spreads(featured: pd.DataFrame, event_map: pd.DataFra
     return consensus
 
 
-def part1_close_cross_check(consensus: pd.DataFrame, games: pd.DataFrame) -> None:
+def compute_close_spreads(consensus: pd.DataFrame, games: pd.DataFrame) -> pd.DataFrame:
+    """game_id, season, close_spread, close_ts — consensus spread at the
+    latest snapshot strictly before commence_time."""
+    merged = consensus.merge(games[["game_id", "commence_ts", "season"]], on="game_id")
+    before_kickoff = merged[merged.snapshot_ts < merged.commence_ts]
+    latest = before_kickoff.sort_values("snapshot_ts").groupby("game_id").tail(1).copy()
+    return latest.rename(columns={"consensus_home_spread": "close_spread", "snapshot_ts": "close_ts"})[
+        ["game_id", "season", "close_spread", "close_ts"]]
+
+
+def part1_close_cross_check(close: pd.DataFrame, games: pd.DataFrame) -> None:
     print("=" * 70)
     print("PART 1 — Close cross-check vs schedules.spread_line")
     print("=" * 70)
 
-    merged = consensus.merge(games[["game_id", "commence_ts", "season", "spread_line"]], on="game_id")
-    before_kickoff = merged[merged.snapshot_ts < merged.commence_ts]
-
-    latest = before_kickoff.sort_values("snapshot_ts").groupby("game_id").tail(1)
+    latest = close.merge(games[["game_id", "spread_line"]], on="game_id").copy()
     n_no_pre_kickoff = games.game_id.nunique() - latest.game_id.nunique()
 
-    latest = latest.copy()
-    latest["diff"] = (latest.consensus_home_spread + latest.spread_line).abs()
+    latest["diff"] = (latest.close_spread + latest.spread_line).abs()
 
     print(f"Games with a pre-kickoff snapshot: {len(latest)} / {games.game_id.nunique()}")
     if n_no_pre_kickoff:
@@ -193,6 +199,7 @@ def part2_drift_table(consensus: pd.DataFrame, games: pd.DataFrame) -> pd.DataFr
         "n_snapshots": sorted_df.groupby("game_id").size().values,
     })
     drift["drift"] = drift.last_spread - drift.first_spread
+    drift["days_elapsed"] = (pd.to_datetime(drift.last_ts) - pd.to_datetime(drift.first_ts)).dt.total_seconds() / 86400
 
     single_snapshot = (drift.n_snapshots == 1).sum()
     print(f"Games analyzed: {len(drift)}  "
@@ -222,7 +229,7 @@ def part3_days_elapsed(drift: pd.DataFrame) -> None:
     print("PART 3 — Days elapsed between first and last observation")
     print("=" * 70)
 
-    days = (pd.to_datetime(drift.last_ts) - pd.to_datetime(drift.first_ts)).dt.total_seconds() / 86400
+    days = drift["days_elapsed"]
 
     print(f"n={len(days)}")
     print(days.describe().to_string())
@@ -231,6 +238,73 @@ def part3_days_elapsed(drift: pd.DataFrame) -> None:
     bins = [-0.001, 0, 1, 2, 3, 5, 7, 10, 14, 21, np.inf]
     _print_histogram(days, bins)
     print()
+
+
+ELAPSED_BUCKETS = [(-0.001, 2, "0-2"), (2, 7, "3-7"), (7, 14, "8-14"),
+                   (14, 30, "15-30"), (30, np.inf, "31+")]
+
+
+def part4_drift_vs_elapsed(drift: pd.DataFrame) -> None:
+    print("=" * 70)
+    print("PART 4 — |drift| vs. days elapsed (open->close window)")
+    print("=" * 70)
+
+    abs_drift = drift["drift"].abs()
+    days = drift["days_elapsed"]
+
+    for lo, hi, label in ELAPSED_BUCKETS:
+        mask = (days > lo) & (days <= hi)
+        n = int(mask.sum())
+        mean_abs = abs_drift[mask].mean() if n else float("nan")
+        median_abs = abs_drift[mask].median() if n else float("nan")
+        print(f"  [{label:6} days] n={n:4d}  mean|drift|={mean_abs:.3f}  median|drift|={median_abs:.3f}")
+    print()
+
+
+def compute_fixed_horizon_open(consensus: pd.DataFrame, games: pd.DataFrame, horizon_days: int) -> pd.DataFrame:
+    """game_id, season, open_spread, open_ts — consensus spread at the
+    latest snapshot at or before (commence_time - horizon_days)."""
+    merged = consensus.merge(games[["game_id", "commence_ts", "season"]], on="game_id")
+    cutoff = merged.commence_ts - pd.Timedelta(days=horizon_days)
+    eligible = merged[merged.snapshot_ts <= cutoff]
+    latest = eligible.sort_values("snapshot_ts").groupby("game_id").tail(1).copy()
+    return latest.rename(columns={"consensus_home_spread": "open_spread", "snapshot_ts": "open_ts"})[
+        ["game_id", "season", "open_spread", "open_ts"]]
+
+
+def part_fixed_horizon_drift(consensus: pd.DataFrame, close: pd.DataFrame, games: pd.DataFrame,
+                              horizon_days: int) -> pd.DataFrame:
+    print("=" * 70)
+    print(f"PART — Fixed-horizon drift: close - (spread at kickoff-{horizon_days}d)")
+    print("=" * 70)
+
+    open_df = compute_fixed_horizon_open(consensus, games, horizon_days)
+    n_total = games.game_id.nunique()
+    n_no_horizon_snapshot = n_total - open_df.game_id.nunique()
+
+    merged = open_df.merge(close[["game_id", "close_spread"]], on="game_id")
+    n_no_close = open_df.game_id.nunique() - merged.game_id.nunique()
+    merged["drift"] = merged.close_spread - merged.open_spread
+
+    print(f"Games with a snapshot at/before kickoff-{horizon_days}d: {open_df.game_id.nunique()} / {n_total}")
+    print(f"  ({n_no_horizon_snapshot} dropped — no snapshot that early)")
+    if n_no_close:
+        print(f"  ({n_no_close} further dropped — no pre-kickoff close either)")
+    print(f"  {len(merged)} games analyzed\n")
+
+    def _report(df, label):
+        d = df["drift"]
+        print(f"[{label}] n={len(d)}  mean={d.mean():+.3f}  median={d.median():+.3f}  "
+              f"sd={d.std():.3f}  min={d.min():+.3f}  max={d.max():+.3f}  "
+              f"frac_zero={(d == 0).mean() * 100:.1f}%")
+
+    _report(merged, "ALL")
+    print()
+    for season, g in merged.groupby("season"):
+        _report(g, f"season {season}")
+    print()
+
+    return merged
 
 
 def main() -> None:
@@ -242,9 +316,14 @@ def main() -> None:
     # pair, and multiple event_ids can share a game_id (reissued IDs)
     games = event_map.drop_duplicates(subset="game_id")
 
-    part1_close_cross_check(consensus, games)
+    close = compute_close_spreads(consensus, games)
+
+    part1_close_cross_check(close, games)
     drift = part2_drift_table(consensus, games)
     part3_days_elapsed(drift)
+    part4_drift_vs_elapsed(drift)
+    part_fixed_horizon_drift(consensus, close, games, horizon_days=7)
+    part_fixed_horizon_drift(consensus, close, games, horizon_days=3)
 
 
 if __name__ == "__main__":
