@@ -121,12 +121,24 @@ def fetch_rosters(force_refresh: bool = False) -> pd.DataFrame:
     return df
 
 
+def fetch_depth_charts(force_refresh: bool = False) -> pd.DataFrame:
+    path = RAW_DIR / "depth_charts.parquet"
+
+    def _fetch():
+        return nfl.import_depth_charts(SEASONS)
+
+    df = _load_or_fetch(path, _fetch, force_refresh)
+    _log_coverage("depth_charts", df, season_col="season")
+    return df
+
+
 def main(force_refresh: bool = False) -> None:
     fetch_schedules(force_refresh)
     fetch_pbp(force_refresh)
     fetch_injuries(force_refresh)
     fetch_snap_counts(force_refresh)
     fetch_rosters(force_refresh)
+    fetch_depth_charts(force_refresh)
 
 
 if __name__ == "__main__":

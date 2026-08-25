@@ -33,6 +33,7 @@ from src.eval.validate_featured import (
 )
 from src.features.player_join import normalize_name, resolve_player_name
 from src.ingest.bulk_props import game_type_for_week
+from src.ingest.team_names import normalize_team_abbr
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EPA_RATINGS_PATH = REPO_ROOT / "data" / "interim" / "epa_ratings.parquet"
@@ -40,6 +41,7 @@ PBP_PATH = REPO_ROOT / "data" / "raw" / "pbp.parquet"
 ROSTERS_PATH = REPO_ROOT / "data" / "raw" / "rosters.parquet"
 SNAP_COUNTS_PATH = REPO_ROOT / "data" / "raw" / "snap_counts.parquet"
 INJURIES_PATH = REPO_ROOT / "data" / "raw" / "injuries.parquet"
+DEPTH_CHARTS_PATH = REPO_ROOT / "data" / "raw" / "depth_charts.parquet"
 
 EPA_SPLITS = ("overall", "pass", "run")
 EPA_COLS = [f"{split}_{side}_epa" for split in EPA_SPLITS for side in ("off", "def")]
@@ -107,22 +109,75 @@ def identify_actual_starters(snap_counts: pd.DataFrame = None, rosters: pd.DataF
     return starters[["season", "week", "team", "player_id"]].reset_index(drop=True)
 
 
-def build_projected_starters(schedules: pd.DataFrame, actual_starters: pd.DataFrame) -> pd.DataFrame:
-    """One row per (season, week, team) for every game in the schedule:
-    projected_player_id (the most recently identified actual starter
-    strictly before this week — carried forward across byes and season
-    boundaries, since that's the only thing knowable in advance) and
-    qb_change (1 if that differs from what was projected the previous
-    week, else 0; 0 whenever either side is unknown)."""
+def load_qb_depth_chart() -> pd.DataFrame:
+    """One row per (season, week, team, depth_rank) for QB entries only.
+    import_depth_charts([2016..2025]) also returns an untagged "current
+    live snapshot" batch (season/week null, ~554k of ~886k rows in one
+    pull) mixed in with the historical ones — dropped here. Team codes are
+    normalized (raw data still has legacy SD/OAK for early seasons)."""
+    dc = pd.read_parquet(DEPTH_CHARTS_PATH)
+    dc = dc[dc.season.notna() & dc.week.notna() & (dc.position == "QB")].copy()
+    dc["season"] = dc["season"].astype(int)
+    dc["week"] = dc["week"].astype(int)
+    dc["team"] = normalize_team_abbr(dc["club_code"])
+    dc["depth_rank"] = dc["depth_team"].astype(int)
+    dc = dc.sort_values("depth_rank").drop_duplicates(subset=["season", "week", "team", "depth_rank"], keep="first")
+    return dc[["season", "week", "team", "depth_rank", "gsis_id"]]
+
+
+def load_qb_injury_reports() -> pd.DataFrame:
+    """One row per (season, week, team, gsis_id): that week's own
+    report_status, latest by date_modified where duplicated."""
+    injuries = pd.read_parquet(
+        INJURIES_PATH, columns=["season", "week", "team", "gsis_id", "report_status", "date_modified"])
+    return injuries.sort_values("date_modified").drop_duplicates(
+        subset=["season", "week", "team", "gsis_id"], keep="last")
+
+
+def build_projected_starters(schedules: pd.DataFrame, actual_starters: pd.DataFrame,
+                              depth_charts: pd.DataFrame, injuries: pd.DataFrame) -> pd.DataFrame:
+    """One row per (season, week, team) for every game in the schedule —
+    the starter projection available BEFORE that week's kickoff, layered:
+      1. base: the most recently identified ACTUAL starter strictly before
+         this week (forward-filled across byes/season boundaries) — the
+         only thing knowable from game results alone.
+      2. overridden by THIS week's own depth-chart #1 QB, if the depth
+         chart has an entry for this (season, week, team) — a genuinely
+         more current, pre-kickoff signal than "same guy as last time."
+      3. overridden again by the depth-chart #2 QB if the resulting
+         projected starter's OWN status on this week's injury report is
+         Out or Doubtful (both reliably mean "will not play" — see the
+         0/55 finding for Doubtful specifically).
+    Also returns qb_change: 1 if this differs from what was projected into
+    the previous week, else 0 (0 whenever either side is unknown).
+    """
     home = schedules[["season", "week", "home_team"]].rename(columns={"home_team": "team"})
     away = schedules[["season", "week", "away_team"]].rename(columns={"away_team": "team"})
     idx = pd.concat([home, away], ignore_index=True).drop_duplicates()
 
+    # --- layer 1: previous actual starter, forward-filled ---
     merged = idx.merge(actual_starters, on=["season", "week", "team"], how="left")
     merged = merged.sort_values(["team", "season", "week"]).reset_index(drop=True)
-
     ffilled = merged.groupby("team")["player_id"].ffill()
-    merged["projected_player_id"] = ffilled.groupby(merged["team"]).shift(1)
+    merged["base_projected"] = ffilled.groupby(merged["team"]).shift(1)
+
+    # --- layer 2: this week's own depth-chart #1, if available ---
+    dc1 = depth_charts[depth_charts.depth_rank == 1][["season", "week", "team", "gsis_id"]].rename(
+        columns={"gsis_id": "depth_chart_starter"})
+    merged = merged.merge(dc1, on=["season", "week", "team"], how="left")
+    merged["projected_player_id"] = merged["depth_chart_starter"].fillna(merged["base_projected"])
+
+    # --- layer 3: injury override, fall back to depth-chart #2 ---
+    inj_lookup = injuries.set_index(["season", "week", "team", "gsis_id"])["report_status"]
+    keys = list(zip(merged.season, merged.week, merged.team, merged.projected_player_id))
+    status = inj_lookup.reindex(keys).to_numpy()
+    needs_override = pd.Series(status, index=merged.index).isin(["Out", "Doubtful"])
+
+    dc2 = depth_charts[depth_charts.depth_rank == 2][["season", "week", "team", "gsis_id"]].rename(
+        columns={"gsis_id": "depth_chart_backup"})
+    merged = merged.merge(dc2, on=["season", "week", "team"], how="left")
+    do_override = needs_override & merged["depth_chart_backup"].notna()
+    merged.loc[do_override, "projected_player_id"] = merged.loc[do_override, "depth_chart_backup"]
 
     prev_projected = merged.groupby("team")["projected_player_id"].shift(1)
     both_known = prev_projected.notna() & merged["projected_player_id"].notna()
@@ -203,12 +258,11 @@ def build_qb_features(games: pd.DataFrame, schedules: pd.DataFrame) -> pd.DataFr
     (as in the modeling dataset). Returns the same rows with home_/away_
     qb_rating, qb_change, qb_injury columns added."""
     actual_starters = identify_actual_starters()
-    projected = build_projected_starters(schedules, actual_starters)
+    depth_charts = load_qb_depth_chart()
+    injuries = load_qb_injury_reports()
+    projected = build_projected_starters(schedules, actual_starters, depth_charts, injuries)
     qb_log = load_qb_dropback_log()
     qb_log_by_id = {qb_id: g for qb_id, g in qb_log.groupby("qb_id")}
-
-    injuries = pd.read_parquet(INJURIES_PATH, columns=["season", "week", "team", "gsis_id", "report_status", "date_modified"])
-    injuries = injuries.sort_values("date_modified").drop_duplicates(subset=["season", "week", "team", "gsis_id"], keep="last")
 
     home = projected.rename(columns={"team": "home_team", "projected_player_id": "home_qb_id", "qb_change": "home_qb_change"})
     away = projected.rename(columns={"team": "away_team", "projected_player_id": "away_qb_id", "qb_change": "away_qb_change"})
@@ -420,6 +474,34 @@ def walk_forward_lgbm(df: pd.DataFrame, numeric_features=NUMERIC_FEATURES, categ
     return per_season, pooled
 
 
+def report_projection_accuracy(schedules: pd.DataFrame) -> pd.DataFrame:
+    """How often the projected starter (available before kickoff) differs
+    from who actually started, by season — restricted to team-weeks where
+    both are known."""
+    actual_starters = identify_actual_starters()
+    depth_charts = load_qb_depth_chart()
+    injuries = load_qb_injury_reports()
+    projected = build_projected_starters(schedules, actual_starters, depth_charts, injuries)
+
+    merged = projected.merge(
+        actual_starters.rename(columns={"player_id": "actual_player_id"}), on=["season", "week", "team"], how="inner")
+    both_known = merged.projected_player_id.notna() & merged.actual_player_id.notna()
+    merged = merged[both_known].copy()
+    merged["differs"] = merged.projected_player_id != merged.actual_player_id
+
+    print("\n" + "=" * 70)
+    print("Projected vs. actual starter — by season")
+    print("=" * 70)
+    by_season = merged.groupby("season")["differs"].agg(["sum", "count"])
+    by_season["rate"] = by_season["sum"] / by_season["count"]
+    for season, row in by_season.iterrows():
+        print(f"  {season}: {int(row['sum'])}/{int(row['count'])} differ ({row['rate']*100:.1f}%)")
+    total = merged["differs"].sum()
+    print(f"  ALL: {int(total)}/{len(merged)} differ ({total/len(merged)*100:.1f}%)")
+
+    return merged
+
+
 def report_qb_injury_counts(df: pd.DataFrame) -> None:
     print("\n" + "=" * 70)
     print("QB injury status — observation counts")
@@ -504,7 +586,9 @@ def main() -> None:
     print("=" * 70)
 
     report_qb_injury_counts(df)
-    run_two_changes_experiment()
+
+    _, schedules = load_data()
+    report_projection_accuracy(schedules)
 
 
 if __name__ == "__main__":
