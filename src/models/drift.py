@@ -40,7 +40,7 @@ data, let alone its labels).
 import numpy as np
 import pandas as pd
 import statsmodels.formula.api as smf
-from sklearn.linear_model import RidgeCV
+from sklearn.linear_model import LogisticRegression, RidgeCV
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.preprocessing import StandardScaler
 
@@ -252,6 +252,87 @@ def walk_forward_ridge(df: pd.DataFrame, numeric_features):
     return per_season, pooled
 
 
+TAIL_THRESHOLD = 1.5
+
+
+def sign_match_accuracy(df: pd.DataFrame, predictor_col: str, label: str) -> None:
+    """Parameter-free directional check: does sign(predictor_col) match
+    sign(target)? No fitting, no walk-forward needed — it's a fixed rule
+    applied to an already no-lookahead feature, not a trained model, so
+    there's no leakage risk to guard against by splitting on season."""
+    nonzero = df[df[predictor_col] != 0]
+    match = np.sign(nonzero[predictor_col]) == np.sign(nonzero["target"])
+    print(f"\n{label}: sign({predictor_col}) == sign(target)")
+    print(f"  n={len(nonzero)} (excludes {len(df) - len(nonzero)} with {predictor_col}==0)  "
+          f"accuracy={match.mean():.3f}  vs 50% baseline: {'BEATS' if match.mean() > 0.5 else 'does NOT beat'}")
+    by_season = nonzero.groupby(nonzero["season"])[[]].apply(
+        lambda g: pd.Series({"n": len(g), "accuracy": match.loc[g.index].mean()}))
+    print(by_season.to_string())
+
+
+def walk_forward_direction_accuracy(df: pd.DataFrame, numeric_features):
+    """Logistic regression predicting sign(target) > 0, walk-forward by
+    season (train strictly-earlier), using `numeric_features` only."""
+    y = (df["target"] > 0).astype(int).to_numpy()
+    X = df[numeric_features].to_numpy(dtype=float)
+    seasons = sorted(df.season.unique())
+    per_season = {}
+    all_true, all_pred = [], []
+
+    for season in seasons[1:]:
+        train_mask = (df.season < season).to_numpy()
+        test_mask = (df.season == season).to_numpy()
+        if train_mask.sum() == 0 or test_mask.sum() == 0 or len(set(y[train_mask])) < 2:
+            continue
+        scaler = StandardScaler().fit(X[train_mask])
+        clf = LogisticRegression(max_iter=2000)
+        clf.fit(scaler.transform(X[train_mask]), y[train_mask])
+        pred = clf.predict(scaler.transform(X[test_mask]))
+
+        per_season[season] = {"n": int(test_mask.sum()), "accuracy": float((pred == y[test_mask]).mean())}
+        all_true.extend(y[test_mask].tolist())
+        all_pred.extend(pred.tolist())
+
+    all_true, all_pred = np.array(all_true), np.array(all_pred)
+    overall_acc = float((all_true == all_pred).mean()) if len(all_true) else float("nan")
+    return per_season, overall_acc, len(all_true)
+
+
+def analyze_tail(df: pd.DataFrame) -> None:
+    tail = df[df["target"].abs() > TAIL_THRESHOLD].copy()
+    print("\n" + "=" * 70)
+    print(f"TAIL ANALYSIS — |drift| > {TAIL_THRESHOLD}")
+    print("=" * 70)
+    print(f"n = {len(tail)} / {len(df)} ({len(tail) / len(df) * 100:.1f}%)")
+    print(tail.groupby("season").size().rename("n").to_string())
+    direction_balance = (tail["target"] > 0).mean()
+    print(f"\nDirection balance in tail: away_gained={direction_balance:.3f}  home_gained={1 - direction_balance:.3f}")
+
+    print("\n--- Can Group B (prior movement) predict the DIRECTION of the remaining move? ---")
+    sign_match_accuracy(tail, "spread_chg_2d", "Momentum rule")
+
+    per_season, overall_acc, n = walk_forward_direction_accuracy(tail, GROUP_B_NUMERIC)
+    print(f"\nWalk-forward logistic regression (all {len(GROUP_B_NUMERIC)} Group B features), "
+          f"train strictly-earlier seasons:")
+    for season, m in sorted(per_season.items()):
+        print(f"  {season}: n={m['n']}  accuracy={m['accuracy']:.3f}")
+    print(f"  POOLED: n={n}  accuracy={overall_acc:.3f}  vs 50% baseline: "
+          f"{'BEATS' if overall_acc > 0.5 else 'does NOT beat'}")
+
+    print("\n--- book_disagreement_h3 vs magnitude of subsequent drift (|target|), tail only ---")
+    abs_drift = tail["target"].abs()
+    pearson = tail["book_disagreement_h3"].corr(abs_drift, method="pearson")
+    spearman = tail["book_disagreement_h3"].corr(abs_drift, method="spearman")
+    print(f"Pearson r={pearson:.3f}   Spearman rho={spearman:.3f}   (n={len(tail)})")
+
+    print("\nBinned table (quartiles of book_disagreement_h3):")
+    bins = pd.qcut(tail["book_disagreement_h3"], q=4, duplicates="drop")
+    table = tail.groupby(bins, observed=True)["target"].apply(
+        lambda s: pd.Series({"n": len(s), "mean_abs_drift": s.abs().mean(), "median_abs_drift": s.abs().median()}))
+    table = table.unstack()
+    print(table.to_string())
+
+
 def main() -> None:
     df = build_dataset()
     print(f"Dataset: {len(df)} games, seasons {sorted(df.season.unique())}")
@@ -276,6 +357,8 @@ def main() -> None:
     print(f"  Group B only: n={b_pooled['n']}  R^2={b_pooled['r2']:.3f}  RMSE={b_pooled['rmse']:.3f}  MAE={b_pooled['mae']:.3f}")
     print(f"  Combined:     n={combined_pooled['n']}  R^2={combined_pooled['r2']:.3f}  RMSE={combined_pooled['rmse']:.3f}  MAE={combined_pooled['mae']:.3f}")
     print("=" * 70)
+
+    analyze_tail(df)
 
 
 if __name__ == "__main__":
