@@ -65,8 +65,8 @@ SPLITS = ("overall", "pass", "run")
 DEFAULT_HALF_LIFE_GAMES = 10.0
 DEFAULT_SHRINK_K = 4.0
 DEFAULT_CARRY_FRACTION = 0.35
-MAX_ITER = 20
-CONV_TOL = 1e-3  # team EPA/play ratings span roughly +/-0.3; 1e-3 is ~0.3% of that range
+MAX_ITER = 500
+CONV_TOL = 1e-4  # team EPA/play ratings span roughly +/-0.3; 1e-4 is ~0.03% of that range
 DAMPING = 0.5  # under-relaxation factor; prevents the offense/defense mutual update from oscillating
 
 ALL_TEAMS = sorted(set(team_name_map().values()))
@@ -131,17 +131,20 @@ def _mu_asof(team_games: pd.DataFrame, split: str, season: int, week: int) -> fl
     return before[f"sum_epa_{split}"].sum() / n
 
 
-def _opponent_adjust(real_games: pd.DataFrame, split: str, mu: float, half_life: float):
+def _opponent_adjust(real_games: pd.DataFrame, split: str, mu: float, half_life: float, max_iter: int = MAX_ITER):
     """real_games: this team-season's real games (already restricted to
     strictly-earlier weeks), one row per (team, opponent, week, n_plays,
     sum_epa) for this split. Returns (off_dev, def_dev, off_weight_sum,
-    def_weight_sum, iterations_used) — the dev dicts are deviations from mu,
-    the weight sums are each team's total recency weight (used later to
-    blend against a season carry-in)."""
+    def_weight_sum, iterations_used, final_max_change) — the dev dicts are
+    deviations from mu, the weight sums are each team's total recency
+    weight (used later to blend against a season carry-in), and
+    final_max_change is the largest single-team change made on the last
+    iteration performed (diagnostic: how far from the convergence
+    tolerance a capped-out boundary actually was)."""
     n_col, s_col = f"n_plays_{split}", f"sum_epa_{split}"
     g = real_games[real_games[n_col] > 0].copy()
     if g.empty:
-        return {}, {}, {}, {}, 0
+        return {}, {}, {}, {}, 0, 0.0
 
     g["off_gb"] = g.sort_values(["team", "week"], ascending=[True, False]).groupby("team").cumcount()
     g["def_gb"] = g.sort_values(["opponent", "week"], ascending=[True, False]).groupby("opponent").cumcount()
@@ -153,7 +156,8 @@ def _opponent_adjust(real_games: pd.DataFrame, split: str, mu: float, half_life:
     def_dev = {t: 0.0 for t in teams}
 
     iterations_used = 0
-    for it in range(1, MAX_ITER + 1):
+    max_change = 0.0
+    for it in range(1, max_iter + 1):
         iterations_used = it
 
         # Gauss-Seidel + damping: naive simultaneous (Jacobi) updates of two
@@ -188,7 +192,7 @@ def _opponent_adjust(real_games: pd.DataFrame, split: str, mu: float, half_life:
 
     off_weight_sum = g.groupby("team")["off_w"].sum().to_dict()
     def_weight_sum = g.groupby("opponent")["def_w"].sum().to_dict()
-    return off_dev, def_dev, off_weight_sum, def_weight_sum, iterations_used
+    return off_dev, def_dev, off_weight_sum, def_weight_sum, iterations_used, max_change
 
 
 def _rating_for_boundary(team_games: pd.DataFrame, season: int, week: int, carry_in,
@@ -209,7 +213,7 @@ def _rating_for_boundary(team_games: pd.DataFrame, season: int, week: int, carry
 
     for split in SPLITS:
         mu = _mu_asof(team_games, split, season, week)
-        off_dev, def_dev, off_w_sum, def_w_sum, iters = _opponent_adjust(real_games, split, mu, half_life)
+        off_dev, def_dev, off_w_sum, def_w_sum, iters, _ = _opponent_adjust(real_games, split, mu, half_life)
         iterations[split] = iters
 
         for t in ALL_TEAMS:
