@@ -62,6 +62,10 @@ NO_SPLIT_NUMERIC_FEATURES = [
 ]
 ALL_CATEGORICAL_FEATURES = CATEGORICAL_FEATURES + QB_CATEGORICAL_FEATURES
 
+HOME_FIELD_FEATURES = ["home_field_x_season2020"]  # not "home_field" itself — see build_dataset docstring
+# base variant for the two-changes experiment: recommended no-split OLS features
+NO_SPLIT_WITH_HOME_FIELD_FEATURES = NO_SPLIT_NUMERIC_FEATURES + HOME_FIELD_FEATURES
+
 LGBM_PARAMS = dict(
     n_estimators=200, learning_rate=0.05, num_leaves=7, min_child_samples=20,
     subsample=0.8, colsample_bytree=0.8, random_state=0, verbosity=-1,
@@ -241,10 +245,27 @@ def build_qb_features(games: pd.DataFrame, schedules: pd.DataFrame) -> pd.DataFr
     return out
 
 
-def build_dataset() -> pd.DataFrame:
+def build_dataset(epa_ratings_df: pd.DataFrame = None, add_home_field_2020: bool = False) -> pd.DataFrame:
     """One row per game with a valid pre-kickoff close: target close_spread
     plus all model features. Restricted to games where the EPA ratings and
-    schedule fields are all available."""
+    schedule fields are all available.
+
+    epa_ratings_df: pass an alternate EPA ratings table (e.g. from
+    build_situational_epa_ratings()) instead of reading
+    data/interim/epa_ratings.parquet — used for the situational-filter
+    experiment without touching the cached parquet.
+
+    add_home_field_2020: adds `home_field` (constant 1, reported but not
+    used as a regressor — it's mathematically identical to the OLS
+    intercept, which already *is* the model's baseline home-field effect;
+    tested this, patsy makes the design matrix exactly singular if both are
+    included even with the automatic intercept suppressed, since it
+    promotes the first categorical to full-rank encoding to compensate,
+    which then collides with home_field too) and
+    `home_field_x_season2020` (1 iff season==2020, else 0 — the actual new
+    regressor, testing whether home-field advantage shifted in the
+    no-fans 2020 season) columns.
+    """
     featured, schedules = load_data()
     event_map = build_event_schedule_map(featured, schedules)
     games = event_map.drop_duplicates(subset="game_id")
@@ -261,7 +282,7 @@ def build_dataset() -> pd.DataFrame:
     sched["surface"] = sched["surface"].str.strip()
     df = df.merge(sched, on=["season", "week", "home_team", "away_team"], how="left")
 
-    epa = pd.read_parquet(EPA_RATINGS_PATH)
+    epa = epa_ratings_df if epa_ratings_df is not None else pd.read_parquet(EPA_RATINGS_PATH)
     home_epa = epa.rename(columns={"team": "home_team", **{c: f"home_{c}" for c in EPA_COLS}})
     away_epa = epa.rename(columns={"team": "away_team", **{c: f"away_{c}" for c in EPA_COLS}})
     df = df.merge(home_epa, on=["season", "week", "home_team"], how="left")
@@ -272,7 +293,13 @@ def build_dataset() -> pd.DataFrame:
 
     df = build_qb_features(df, schedules)
 
+    if add_home_field_2020:
+        df["home_field"] = 1
+        df["home_field_x_season2020"] = (df["season"] == 2020).astype(int)
+
     required = ["target_spread"] + NUMERIC_FEATURES + ALL_CATEGORICAL_FEATURES
+    if add_home_field_2020:
+        required = required + ["home_field", "home_field_x_season2020"]
     n_before = len(df)
     df = df.dropna(subset=required)
     n_dropped = n_before - len(df)
@@ -292,6 +319,30 @@ def build_dataset() -> pd.DataFrame:
     return df
 
 
+def build_situational_epa_ratings() -> pd.DataFrame:
+    """EPA ratings recomputed from plays filtered to early downs (1st/2nd),
+    win probability in [0.10, 0.90], and excluding the final two minutes of
+    each half — otherwise identical method/parameters to epa_ratings.py.
+    Computed in-memory; does not touch the cached epa_ratings.parquet."""
+    from src.features.epa_ratings import PBP_COLUMNS, compute_all_ratings, load_plays
+
+    extra_cols = list(dict.fromkeys(PBP_COLUMNS + ["down", "wp", "half_seconds_remaining"]))
+    raw = pd.read_parquet(PBP_PATH, columns=extra_cols)
+    plays = load_plays(raw)  # standard epa_ratings filter: epa not null, pass/run, no 2pt
+
+    n_before = len(plays)
+    plays = plays[
+        plays.down.isin([1, 2])
+        & plays.wp.between(0.10, 0.90)
+        & (plays.half_seconds_remaining > 120)
+    ]
+    print(f"Situational EPA filter: {len(plays)}/{n_before} plays kept "
+          f"(early downs, wp in [0.10,0.90], outside final 2 min of each half)")
+
+    ratings_df, _ = compute_all_ratings(plays=plays)
+    return ratings_df
+
+
 def _metrics(y_true, y_pred) -> dict:
     return {
         "n": len(y_true),
@@ -309,19 +360,22 @@ def _print_metrics_table(per_season: dict, pooled: dict, label: str) -> None:
     print(f"  {'POOLED':>8}  {pooled['n']:>5}  {pooled['rmse']:>7.3f}  {pooled['mae']:>7.3f}  {pooled['r2']:>8.3f}")
 
 
-def _ols_formula(numeric_features, categorical_features) -> str:
+def _ols_formula(numeric_features, categorical_features, suppress_intercept: bool = False) -> str:
     terms = numeric_features + [f"C({c})" for c in categorical_features]
-    return "target_spread ~ " + " + ".join(terms)
+    prefix = "target_spread ~ 0 + " if suppress_intercept else "target_spread ~ "
+    return prefix + " + ".join(terms)
 
 
-def fit_full_ols(df: pd.DataFrame, numeric_features=NUMERIC_FEATURES, categorical_features=ALL_CATEGORICAL_FEATURES):
+def fit_full_ols(df: pd.DataFrame, numeric_features=NUMERIC_FEATURES, categorical_features=ALL_CATEGORICAL_FEATURES,
+                  suppress_intercept: bool = False):
     """OLS on the full dataset, purely for a readable coefficient table —
     not used for the walk-forward metrics (see walk_forward_ols)."""
-    return smf.ols(_ols_formula(numeric_features, categorical_features), data=df).fit()
+    return smf.ols(_ols_formula(numeric_features, categorical_features, suppress_intercept), data=df).fit()
 
 
-def walk_forward_ols(df: pd.DataFrame, numeric_features=NUMERIC_FEATURES, categorical_features=ALL_CATEGORICAL_FEATURES):
-    formula = _ols_formula(numeric_features, categorical_features)
+def walk_forward_ols(df: pd.DataFrame, numeric_features=NUMERIC_FEATURES, categorical_features=ALL_CATEGORICAL_FEATURES,
+                      suppress_intercept: bool = False):
+    formula = _ols_formula(numeric_features, categorical_features, suppress_intercept)
     seasons = sorted(df.season.unique())
     per_season = {}
     all_true, all_pred = [], []
@@ -366,6 +420,56 @@ def walk_forward_lgbm(df: pd.DataFrame, numeric_features=NUMERIC_FEATURES, categ
     return per_season, pooled
 
 
+def report_qb_injury_counts(df: pd.DataFrame) -> None:
+    print("\n" + "=" * 70)
+    print("QB injury status — observation counts")
+    print("=" * 70)
+    combined = pd.concat([df["home_qb_injury"], df["away_qb_injury"]])
+    print("Combined (home + away):")
+    print(combined.value_counts().to_string())
+    print("\nHome only:")
+    print(df["home_qb_injury"].value_counts().to_string())
+    print("\nAway only:")
+    print(df["away_qb_injury"].value_counts().to_string())
+
+
+def run_two_changes_experiment() -> None:
+    print("\n" + "=" * 70)
+    print("Two-change experiment: situational EPA filter x home-field/2020 interaction")
+    print("=" * 70)
+
+    situational_epa = build_situational_epa_ratings()
+
+    variants = {
+        "baseline (existing EPA, no home-field term)": dict(epa_ratings_df=None, add_home_field_2020=False),
+        "change 1 only: situational EPA": dict(epa_ratings_df=situational_epa, add_home_field_2020=False),
+        "change 2 only: home-field x 2020": dict(epa_ratings_df=None, add_home_field_2020=True),
+        "both changes combined": dict(epa_ratings_df=situational_epa, add_home_field_2020=True),
+    }
+
+    results = {}
+    for label, kwargs in variants.items():
+        add_hf = kwargs["add_home_field_2020"]
+        df = build_dataset(**kwargs)
+        features = NO_SPLIT_WITH_HOME_FIELD_FEATURES if add_hf else NO_SPLIT_NUMERIC_FEATURES
+        per_season, pooled = walk_forward_ols(df, numeric_features=features)
+        results[label] = (per_season, pooled)
+        _print_metrics_table(per_season, pooled, f"OLS — {label}")
+
+    print("\n" + "=" * 70)
+    print("Summary — pooled walk-forward R^2")
+    print("=" * 70)
+    for label, (_, pooled) in results.items():
+        print(f"  {label}: R^2={pooled['r2']:.3f}  RMSE={pooled['rmse']:.3f}  MAE={pooled['mae']:.3f}")
+    print("=" * 70)
+
+    # coefficient table for change 2 (and combined), to see the season-2020 interaction itself
+    hf_df = build_dataset(add_home_field_2020=True)
+    hf_model = fit_full_ols(hf_df, numeric_features=NO_SPLIT_WITH_HOME_FIELD_FEATURES)
+    print("\nOLS coefficients — change 2 (home-field x season-2020), fit on all available games:")
+    print(hf_model.summary())
+
+
 def main() -> None:
     df = build_dataset()
     print(f"Dataset: {len(df)} games, seasons {sorted(df.season.unique())}")
@@ -398,6 +502,9 @@ def main() -> None:
     print(f"  OLS, no splits:      R^2={ols_ns_pooled['r2']:.3f}  RMSE={ols_ns_pooled['rmse']:.3f}  MAE={ols_ns_pooled['mae']:.3f}")
     print(f"  LightGBM, with splits: R^2={lgbm_pooled['r2']:.3f}  RMSE={lgbm_pooled['rmse']:.3f}  MAE={lgbm_pooled['mae']:.3f}")
     print("=" * 70)
+
+    report_qb_injury_counts(df)
+    run_two_changes_experiment()
 
 
 if __name__ == "__main__":
