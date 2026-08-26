@@ -1,64 +1,65 @@
-"""Sanity-check the anytime-TD props market: overround, de-vig, and
+"""Sanity-check the anytime-TD props market: margin-based de-vig and
 calibration against actual touchdown scorers.
 
 Pure offline analysis — no network calls, only cached parquet files.
 
-## Why "sum across all players" instead of per-player Yes/No de-vig
+## De-vig method (v2 — replaces the earlier Shin/proportional pass)
 
-The obvious way to de-vig a 2-sided market is per-outcome (Yes price vs No
-price). That doesn't work here: only 1,479/169,345 (0.9%) of anytime-TD rows
-have a "No" side priced at all — books only quote "Yes" for this market.
+Per-outcome (Yes/No) de-vig doesn't work here: only 0.9% of anytime-TD rows
+have a "No" side priced at all. The first version instead summed all
+players' Yes-prices in a (game_id, book) and de-vigged them as if mutually
+exclusive (Shin or proportional normalization to 1.0) — mechanically valid,
+but the wrong model: multiple players DO score in the same game, so forcing
+the field to sum to 1 discards real information and (as found) produced
+probabilities calibrated ~4x too low across every decile and position.
 
-So de-vigging has to work the way it's actually done for these "anytime
-scorer" markets in practice (this is the standard treatment in the market-
-efficiency literature the task references, e.g. github.com/mberk/shin, MIT
-licensed, whose calculate_implied_probabilities() takes a full list of odds
-for one market and returns de-vigged probabilities + z): treat every
-player's Yes-price in a (game_id, book) as one N-way field and de-vig them
-together, exactly as if this were a mutually-exclusive market (only one
-runner wins). It isn't really mutually exclusive — multiple players DO
-score in the same game — so both de-vig methods here will, by construction,
-force each (game_id, book)'s de-vigged probabilities to sum to ~1.0. That's
-not a bug: comparing that trivial ~1.0 against the real, much larger number
-of distinct actual scorers per game (part 3/4) is the point — it exposes
-that mutual-exclusivity de-vigging is the wrong model for this market type,
-and should show up again in part 5 as systematic under-prediction in the
-calibration table.
+This version instead estimates a per-leg MULTIPLICATIVE margin:
+    m(game, book) = sum_i(raw implied prob) / expected_distinct_scorers(game)
+    devigged_prob_i = raw_prob_i / m(game, book)
+`expected_distinct_scorers` comes from a simple OOS linear fit (walk-forward
+by season, train strictly-earlier seasons) of actual distinct scorers on
+the game's own total line alone — a genuine held-out prediction, not the
+realized count itself, so m isn't circularly defined from the answer.
 
-## Shin's method (implemented from the standard formula, not literally
-vendored from mberk/shin, to keep this self-contained and dependency-free)
+By construction, sum_i(devigged_prob_i) == expected_distinct_scorers(game)
+for every book on a given game (m absorbs whatever that book's own raw sum
+was) — every book's de-vigged field lands on the same model-implied count
+for that game. That's intentional, not a bug: it's what makes different
+books' de-vigged probabilities comparable at all, and it's a genuinely
+game-varying number now (unlike v1's flat 1.0), driven by the total line.
 
-For raw implied probabilities p_i = 1/decimal_odds_i over n outcomes with
-R = sum(p_i), Shin's model solves for z in:
-    sum_i [ sqrt(z^2 + 4(1-z) p_i^2 / R) - z ] / (2(1-z)) = 1
-and the de-vigged probability for outcome i is that same per-i term. Verified
-by hand for the symmetric 2-outcome case (p1=p2=0.55, R=1.10): solving gives
-z=0.1, matching the well-known z ~= R-1 approximation for small, symmetric
-2-way overrounds.
+## Scratch definition (v2 — replaces the pbp-participation check)
+
+v1 flagged a prop row as a "scratch" if the player never appeared in any of
+several pbp participation columns for that game — 22.8% of rows. Checking
+who those actually were showed the check was overbroad: the top names
+(Reggie Gilliam, Chris Manhertz, Patrick Ricard, C.J. Ham) are blocking
+FBs/TEs who dressed and played but simply recorded zero offensive touches
+that game — not scratches. This version uses snap_counts.parquet directly:
+a player is a scratch only if he has no snap-count row for that game, or
+offense_snaps == 0. snap_counts only carries a PFR player id (not the GSIS
+id used everywhere else), so matching is by normalized name + team + season
++ week, reusing src.features.player_join's normalizer.
 """
 
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import brentq
+import statsmodels.formula.api as smf
+
+from src.features.player_join import normalize_name
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROPS_PATH = REPO_ROOT / "data" / "interim" / "props.parquet"
 EVENT_INDEX_PATH = REPO_ROOT / "data" / "raw" / "props" / "_event_index.parquet"
 PBP_PATH = REPO_ROOT / "data" / "raw" / "pbp.parquet"
 ROSTERS_PATH = REPO_ROOT / "data" / "raw" / "rosters.parquet"
+SCHEDULES_PATH = REPO_ROOT / "data" / "raw" / "schedules.parquet"
+SNAP_COUNTS_PATH = REPO_ROOT / "data" / "raw" / "snap_counts.parquet"
 
 SKILL_POSITIONS = ("QB", "RB", "WR", "TE")
 ACTUAL_SCORER_SEASONS = (2023, 2024, 2025)
-
-# Columns used to decide "did this player appear in this game's pbp at all"
-# (scratch detection) — every offensive way a skill player leaves a trace.
-PARTICIPATION_COLUMNS = [
-    "passer_player_id", "rusher_player_id", "receiver_player_id", "td_player_id",
-    "fumbled_1_player_id", "fumbled_2_player_id",
-    "lateral_receiver_player_id", "lateral_rusher_player_id",
-]
 
 
 def load_td_props() -> pd.DataFrame:
@@ -72,54 +73,9 @@ def load_td_props() -> pd.DataFrame:
         & props.player_id.notna()
     ].copy()
 
-    idx = pd.read_parquet(EVENT_INDEX_PATH)[["event_id", "game_id", "season", "week"]]
+    idx = pd.read_parquet(EVENT_INDEX_PATH)[["event_id", "game_id", "season", "week", "home_team", "away_team"]]
     td = td.merge(idx, on="event_id", how="inner")
     td["p_raw"] = 1.0 / td["price"]
-    return td
-
-
-def shin_devig(p_raw: np.ndarray) -> tuple:
-    """p_raw: raw implied probabilities for one (game_id, book) field.
-    Returns (devigged_probs, z). Falls back to proportional (z=0 model,
-    equivalent when there's no overround) if R<=1 or the field has a
-    single outcome (z undefined)."""
-    R = p_raw.sum()
-    if R <= 1.0 or len(p_raw) < 2:
-        return p_raw / R, 0.0
-
-    def f(z):
-        return np.sum((np.sqrt(z ** 2 + 4 * (1 - z) * p_raw ** 2 / R) - z) / (2 * (1 - z))) - 1.0
-
-    # f(0) = sqrt(R) - 1 > 0 for R>1; f approaches a finite limit < 0 as z->1^-,
-    # so a root exists in (0, 1) whenever there's a real overround to remove.
-    try:
-        z = brentq(f, 1e-9, 1 - 1e-9)
-    except ValueError:
-        return p_raw / R, 0.0
-    devigged = (np.sqrt(z ** 2 + 4 * (1 - z) * p_raw ** 2 / R) - z) / (2 * (1 - z))
-    return devigged, z
-
-
-def compute_devig(td: pd.DataFrame) -> pd.DataFrame:
-    """Adds p_prop (proportional de-vig) and p_shin (Shin de-vig) columns,
-    plus a `shin_z` column (repeated per row within a (game_id, book) group)."""
-    td = td.sort_values(["game_id", "book"]).reset_index(drop=True)
-    p_prop = np.empty(len(td))
-    p_shin = np.empty(len(td))
-    z_col = np.empty(len(td))
-
-    for _, idx in td.groupby(["game_id", "book"]).groups.items():
-        pos = td.index.get_indexer(idx)
-        raw = td.loc[idx, "p_raw"].to_numpy()
-        R = raw.sum()
-        p_prop[pos] = raw / R
-        devigged, z = shin_devig(raw)
-        p_shin[pos] = devigged
-        z_col[pos] = z
-
-    td["p_prop"] = p_prop
-    td["p_shin"] = p_shin
-    td["shin_z"] = z_col
     return td
 
 
@@ -139,19 +95,48 @@ def compute_actual_scorers(seasons=ACTUAL_SCORER_SEASONS) -> pd.DataFrame:
     return scorers.rename(columns={"td_player_id": "player_id"})[["season", "game_id", "player_id", "position"]]
 
 
-def compute_participation_sets(seasons=ACTUAL_SCORER_SEASONS) -> dict:
-    """{game_id: set(player_id)} — every player_id appearing in any
-    offensive participation column, for scratch detection."""
-    cols = ["season", "game_id"] + PARTICIPATION_COLUMNS
-    pbp = pd.read_parquet(PBP_PATH, columns=cols)
-    pbp = pbp[pbp.season.isin(seasons)]
+def load_game_totals() -> pd.DataFrame:
+    """game_id, total_line — nflverse's own closing total for the game."""
+    sched = pd.read_parquet(SCHEDULES_PATH, columns=["game_id", "total_line"])
+    return sched.dropna(subset=["total_line"])
 
-    sets = {}
-    for col in PARTICIPATION_COLUMNS:
-        sub = pbp[["game_id", col]].dropna(subset=[col])
-        for game_id, group in sub.groupby("game_id")[col]:
-            sets.setdefault(game_id, set()).update(group.unique())
-    return sets
+
+def fit_expected_scorers_walkforward(per_game_actual: pd.DataFrame, game_totals: pd.DataFrame) -> pd.DataFrame:
+    """Walk-forward (train strictly-earlier seasons) OLS: actual_scorers ~
+    total_line. Prints the fit per fold, returns game_id -> predicted
+    expected_scorers for every game in an evaluable (non-first) season."""
+    df = per_game_actual.merge(game_totals, on="game_id", how="inner")
+    seasons = sorted(df.season.unique())
+
+    print("\nExpected-scorers fit (actual_scorers ~ total_line), walk-forward by season:")
+    preds = []
+    for season in seasons[1:]:
+        train = df[df.season < season]
+        test = df[df.season == season]
+        model = smf.ols("actual_scorers ~ total_line", data=train).fit()
+        intercept, slope = model.params["Intercept"], model.params["total_line"]
+        pred = model.predict(test)
+        mae = float((pred - test["actual_scorers"]).abs().mean())
+        print(f"  train<{season} (n={len(train)}): intercept={intercept:+.3f}  slope={slope:+.4f}  "
+              f"R^2={model.rsquared:.3f}  test_mae={mae:.3f}")
+        preds.append(pd.DataFrame({"game_id": test.game_id.values, "expected_scorers": pred.values}))
+
+    if seasons:
+        print(f"  (season {seasons[0]} excluded — no earlier season to train on)")
+
+    return pd.concat(preds, ignore_index=True) if preds else pd.DataFrame(columns=["game_id", "expected_scorers"])
+
+
+def compute_margin_devig(td: pd.DataFrame, expected_scorers: pd.DataFrame) -> pd.DataFrame:
+    """Adds expected_scorers, margin `m`, and p_devig = p_raw / m. Rows for
+    games without a walk-forward expected_scorers prediction (the first
+    season) are dropped."""
+    td = td.merge(expected_scorers, on="game_id", how="inner")
+
+    raw_sum = td.groupby(["game_id", "book"])["p_raw"].transform("sum")
+    td["m"] = raw_sum / td["expected_scorers"]
+    td["p_devig"] = td["p_raw"] / td["m"]
+    return td
 
 
 def report_overround(td: pd.DataFrame) -> None:
@@ -165,24 +150,25 @@ def report_overround(td: pd.DataFrame) -> None:
 
 def report_devig(td: pd.DataFrame) -> None:
     print("\n" + "=" * 70)
-    print("PART 2 — De-vigged summed probability, per (game, book)")
+    print("PART 2 — Margin-based de-vig")
     print("=" * 70)
 
-    for col, label in [("p_prop", "Proportional"), ("p_shin", "Shin")]:
-        per_game_book = td.groupby(["game_id", "book"])[col].sum()
-        print(f"\n{label} de-vig — summed probability distribution:")
-        print(per_game_book.describe(percentiles=[0.25, 0.5, 0.75]).to_string())
+    print("\nMargin m — distribution across (game, book) markets:")
+    m_per_market = td.groupby(["game_id", "book"])["m"].first()
+    print(m_per_market.describe(percentiles=[0.25, 0.5, 0.75]).to_string())
 
-    z_per_market = td.groupby(["game_id", "book"])["shin_z"].first()
-    print("\nShin's z — distribution across (game, book) markets:")
-    print(z_per_market.describe(percentiles=[0.25, 0.5, 0.75]).to_string())
+    print("\nResulting summed probability after de-vig, per (game, book) "
+          "(== that game's expected_scorers by construction, so this distribution "
+          "is really the expected_scorers distribution, not a fixed constant like v1's 1.0):")
+    devig_sum = td.groupby(["game_id", "book"])["p_devig"].sum()
+    print(devig_sum.describe(percentiles=[0.25, 0.5, 0.75]).to_string())
 
 
 def report_actual_scorers(scorers: pd.DataFrame) -> pd.DataFrame:
     print("\n" + "=" * 70)
     print(f"PART 3 — Actual distinct QB/RB/WR/TE TD scorers per game, {ACTUAL_SCORER_SEASONS}")
     print("=" * 70)
-    per_game = scorers.groupby("game_id")["player_id"].nunique()
+    per_game = scorers.groupby(["season", "game_id"])["player_id"].nunique()
     print(f"n = {len(per_game)} games")
     print(f"mean = {per_game.mean():.3f}")
     print("\nFull distribution:")
@@ -194,73 +180,110 @@ def report_comparison(td: pd.DataFrame, per_game_actual: pd.DataFrame) -> None:
     print("\n" + "=" * 70)
     print("PART 4 — De-vigged sum (part 2) vs actual distinct scorers (part 3)")
     print("=" * 70)
+    print("Note: de-vigged sum is book-invariant by construction (always equals that "
+          "game's expected_scorers, regardless of book) — 'by book' below reflects each "
+          "book's game mix, not a book-specific de-vig effect.")
 
-    devig_sum = td.groupby(["game_id", "book", "season"])[["p_prop", "p_shin"]].sum().reset_index()
-    merged = devig_sum.merge(per_game_actual, on="game_id", how="inner")
+    devig_sum = td.groupby(["game_id", "book", "season"])["p_devig"].sum().reset_index()
+    merged = devig_sum.merge(per_game_actual[["game_id", "actual_scorers"]], on="game_id", how="inner")
 
     print("\nBy season (mean across books):")
-    by_season = merged.groupby("season")[["p_prop", "p_shin", "actual_scorers"]].mean()
-    print(by_season.to_string())
+    print(merged.groupby("season")[["p_devig", "actual_scorers"]].mean().to_string())
 
     print("\nBy book (mean across seasons):")
-    by_book = merged.groupby("book")[["p_prop", "p_shin", "actual_scorers"]].mean().sort_values("actual_scorers")
-    print(by_book.to_string())
+    print(merged.groupby("book")[["p_devig", "actual_scorers"]].mean().sort_values("actual_scorers").to_string())
 
 
-def report_calibration(td: pd.DataFrame, actual_scorer_pairs: pd.DataFrame,
-                        participation: dict) -> None:
+def load_scratch_lookup(seasons=ACTUAL_SCORER_SEASONS) -> dict:
+    """{(season, week, team, normalized_name): offense_snaps} from
+    snap_counts.parquet, for scratch detection by name (snap_counts only
+    carries a PFR id, not the GSIS id used everywhere else)."""
+    # No position filter here: snap_counts labels some props-side "RB"s (e.g.
+    # blocking fullbacks) as "FB" instead — filtering to SKILL_POSITIONS would
+    # exclude their real snap rows entirely and misclassify them as scratches
+    # regardless of team/week/name match (verified: Kyle Juszczyk, Patrick
+    # Ricard, Reggie Gilliam, C.J. Ham all do this). Participation doesn't
+    # depend on which label snap_counts happens to use for the position.
+    snaps = pd.read_parquet(SNAP_COUNTS_PATH)
+    snaps = snaps[snaps.season.isin(seasons)].copy()
+    snaps["norm_name"] = snaps["player"].map(normalize_name)
+    snaps = snaps.groupby(["season", "week", "team", "norm_name"])["offense_snaps"].sum()
+    return snaps.to_dict()
+
+
+def load_player_teams(seasons=ACTUAL_SCORER_SEASONS) -> dict:
+    """{(season, player_id): team} — one team per player per season (any
+    week; used only to look up the snap-count row, not for correctness-
+    critical logic, consistent with how team assignment is handled
+    elsewhere in this project)."""
+    rosters = pd.read_parquet(ROSTERS_PATH, columns=["season", "player_id", "team"])
+    rosters = rosters[rosters.season.isin(seasons)]
+    return rosters.drop_duplicates(subset=["season", "player_id"]).set_index(["season", "player_id"])["team"].to_dict()
+
+
+def compute_is_scratch(td: pd.DataFrame) -> pd.Series:
+    player_teams = load_player_teams()
+    scratch_lookup = load_scratch_lookup()
+
+    teams = td.set_index(["season", "player_id"]).index.map(player_teams)
+    norm_names = td["player_name"].map(normalize_name)
+    keys = list(zip(td["season"], td["week"], teams, norm_names))
+    snaps = pd.Series(keys, index=td.index).map(scratch_lookup)
+    return snaps.isna() | (snaps == 0)
+
+
+def report_calibration(td: pd.DataFrame, actual_scorer_pairs: pd.DataFrame) -> None:
     print("\n" + "=" * 70)
     print("PART 5 — Calibration: predicted de-vigged probability vs actual hit rate")
     print("=" * 70)
 
     scored = set(zip(actual_scorer_pairs.game_id, actual_scorer_pairs.player_id))
 
-    def is_scratch(row):
-        participants = participation.get(row.game_id)
-        return participants is not None and row.player_id not in participants
-
-    is_scratch_mask = td.apply(is_scratch, axis=1)
-    n_scratch = int(is_scratch_mask.sum())
-    print(f"\nProp rows whose player never appears in that game's pbp at all (scratches, excluded): "
+    is_scratch = compute_is_scratch(td)
+    n_scratch = int(is_scratch.sum())
+    print(f"\nProp rows that are scratches (no snap-count row, or offense_snaps==0): "
           f"{n_scratch} / {len(td)} ({n_scratch / len(td) * 100:.2f}%)")
 
-    df = td[~is_scratch_mask].copy()
-    df["actual"] = df.apply(lambda r: (r.game_id, r.player_id) in scored, axis=1)
+    df = td[~is_scratch].copy()
+    df["actual"] = list(zip(df.game_id, df.player_id))
+    df["actual"] = df["actual"].isin(scored)
 
-    def calibration_table(sub: pd.DataFrame, prob_col: str) -> pd.DataFrame:
+    def calibration_table(sub: pd.DataFrame) -> pd.DataFrame:
         sub = sub.copy()
-        sub["decile"] = pd.qcut(sub[prob_col], q=10, duplicates="drop")
-        table = sub.groupby("decile", observed=True).agg(
-            n=("actual", "size"), predicted=(prob_col, "mean"), actual_hit_rate=("actual", "mean"))
-        return table
+        sub["decile"] = pd.qcut(sub["p_devig"], q=10, duplicates="drop")
+        return sub.groupby("decile", observed=True).agg(
+            n=("actual", "size"), predicted=("p_devig", "mean"), actual_hit_rate=("actual", "mean"))
 
-    for prob_col, label in [("p_prop", "Proportional"), ("p_shin", "Shin")]:
-        print(f"\n--- {label} de-vig, pooled across books, deciles ---")
-        print(calibration_table(df, prob_col).to_string())
+    print("\n--- Pooled across books, deciles ---")
+    print(calibration_table(df).to_string())
 
     for position in SKILL_POSITIONS:
         pos_df = df[df.position == position]
-        print(f"\n--- {position} only, proportional de-vig, deciles (n={len(pos_df)}) ---")
-        print(calibration_table(pos_df, "p_prop").to_string())
-        print(f"\n--- {position} only, Shin de-vig, deciles (n={len(pos_df)}) ---")
-        print(calibration_table(pos_df, "p_shin").to_string())
+        print(f"\n--- {position} only, deciles (n={len(pos_df)}) ---")
+        print(calibration_table(pos_df).to_string())
 
 
 def main() -> None:
     td = load_td_props()
     print(f"Loaded {len(td)} anytime-TD Yes-side QB/RB/WR/TE prop rows")
-    td = compute_devig(td)
 
     report_overround(td)
-    report_devig(td)
 
     scorers = compute_actual_scorers()
     per_game_actual = report_actual_scorers(scorers)
 
-    report_comparison(td, per_game_actual)
+    game_totals = load_game_totals()
+    expected_scorers = fit_expected_scorers_walkforward(per_game_actual, game_totals)
 
-    participation = compute_participation_sets()
-    report_calibration(td, scorers, participation)
+    n_before = td.game_id.nunique()
+    td = compute_margin_devig(td, expected_scorers)
+    n_after = td.game_id.nunique()
+    print(f"\n(Games in the first season, {sorted(per_game_actual.season.unique())[0]}, have no walk-forward "
+          f"expected_scorers prediction and are excluded from de-vig onward: {n_after}/{n_before} games retained)")
+
+    report_devig(td)
+    report_comparison(td, per_game_actual)
+    report_calibration(td, scorers)
 
 
 if __name__ == "__main__":
