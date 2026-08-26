@@ -15,8 +15,9 @@ import numpy as np
 import pandas as pd
 
 from src.eval.props_sanity import (
-    compute_actual_scorers, compute_is_scratch, compute_margin_devig,
-    fit_expected_scorers_walkforward, load_game_totals, load_td_props,
+    EVENT_INDEX_PATH, PROPS_PATH, compute_actual_scorers, compute_is_scratch,
+    compute_margin_devig, fit_expected_scorers_walkforward, load_game_totals,
+    load_td_props,
 )
 
 OUTLIER_THRESHOLDS = (0.02, 0.04, 0.06)
@@ -74,6 +75,9 @@ def compute_outlier_table(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
             continue
         values = g["p_devig"].to_numpy()
         books = g["book"].to_numpy()
+        prices = g["price"].to_numpy()
+        p_raws = g["p_raw"].to_numpy()
+        season = g["season"].iloc[0]
         actual = int(g["actual"].iloc[0])
 
         for i in range(len(values)):
@@ -82,6 +86,7 @@ def compute_outlier_table(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
             if abs(diff) > threshold:
                 rows.append({
                     "game_id": game_id, "player_id": player_id, "book": books[i],
+                    "season": season, "price": prices[i], "p_raw": p_raws[i],
                     "book_p": values[i], "median_others": med_others, "diff": diff,
                     "direction": "above" if diff > 0 else "below", "actual": actual,
                 })
@@ -162,6 +167,75 @@ def report_by_book(df: pd.DataFrame, outlier_tables: dict) -> None:
         print(table.to_string())
 
 
+def report_bettable_side(outlier_tables: dict) -> None:
+    """Below-median outliers: the book prices this player's TD as LESS
+    likely than its peers, i.e. offers longer (more generous) odds than
+    the market consensus implies — the side you'd actually back."""
+    print("\n" + "=" * 70)
+    print("PART 5 — Bettable side: below-median outliers, backed at the outlier book's own price")
+    print("=" * 70)
+
+    for threshold in OUTLIER_THRESHOLDS:
+        below = outlier_tables[threshold]
+        below = below[below.direction == "below"].copy()
+        print(f"\n--- X = {threshold * 100:.0f}pp (n={len(below)}) ---")
+        if below.empty:
+            print("  no below-median outlier cases at this threshold")
+            continue
+
+        below["profit"] = below["actual"] * below["price"] - 1.0
+
+        print(f"  POOLED: n={len(below)}  hit_rate={below.actual.mean():.3f}  "
+              f"raw_implied_p(w/ vig)={below.p_raw.mean():.3f}  ROI={below.profit.mean() * 100:+.2f}%")
+
+        print("\n  By book:")
+        rows = []
+        for book, sub in below.groupby("book"):
+            rows.append({
+                "book": book, "n": len(sub), "hit_rate": sub.actual.mean(),
+                "raw_implied_p": sub.p_raw.mean(), "roi_pct": sub.profit.mean() * 100,
+            })
+        print(pd.DataFrame(rows).set_index("book").sort_values("n", ascending=False).to_string())
+
+        print("\n  By season:")
+        rows = []
+        for season, sub in below.groupby("season"):
+            rows.append({
+                "season": season, "n": len(sub), "hit_rate": sub.actual.mean(),
+                "raw_implied_p": sub.p_raw.mean(), "roi_pct": sub.profit.mean() * 100,
+            })
+        print(pd.DataFrame(rows).set_index("season").to_string())
+
+
+def load_no_side_keys() -> set:
+    """{(game_id, player_id, book)} for every anytime-TD 'No' quote ever
+    offered — used to check which above-median outliers would have been
+    layable via an actual No price rather than needing a synthetic lay."""
+    props = pd.read_parquet(PROPS_PATH)
+    no = props[
+        (props.market == "player_anytime_td") & (props.side == "No") & props.player_id.notna()
+    ].copy()
+    idx = pd.read_parquet(EVENT_INDEX_PATH)[["event_id", "game_id"]]
+    no = no.merge(idx, on="event_id", how="inner")
+    return set(zip(no.game_id, no.player_id, no.book))
+
+
+def report_layable_no_side(outlier_tables: dict) -> None:
+    print("\n" + "=" * 70)
+    print("PART 6 — Above-median outliers where a 'No' price existed (layable)")
+    print("=" * 70)
+
+    no_keys = load_no_side_keys()
+    for threshold in OUTLIER_THRESHOLDS:
+        above = outlier_tables[threshold]
+        above = above[above.direction == "above"].copy()
+        has_no = above.apply(lambda r: (r.game_id, r.player_id, r.book) in no_keys, axis=1)
+        n_layable = int(has_no.sum())
+        print(f"\n--- X = {threshold * 100:.0f}pp: {n_layable} / {len(above)} above-median outliers had a No price ---")
+        if n_layable:
+            print(above[has_no].groupby("book").size().sort_values(ascending=False).to_string())
+
+
 def main() -> None:
     df = build_devigged_props()
     print(f"Non-scratch anytime-TD prop rows: {len(df)}")
@@ -172,6 +246,8 @@ def main() -> None:
     report_outlier_counts(df, outlier_tables)
     report_predictive_comparison(outlier_tables)
     report_by_book(df, outlier_tables)
+    report_bettable_side(outlier_tables)
+    report_layable_no_side(outlier_tables)
 
 
 if __name__ == "__main__":
