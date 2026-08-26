@@ -15,13 +15,19 @@ import numpy as np
 import pandas as pd
 
 from src.eval.props_sanity import (
-    EVENT_INDEX_PATH, PROPS_PATH, compute_actual_scorers, compute_is_scratch,
+    ACTUAL_SCORER_SEASONS, EVENT_INDEX_PATH, PBP_PATH, PROPS_PATH,
+    SKILL_POSITIONS, compute_actual_scorers, compute_is_scratch,
     compute_margin_devig, fit_expected_scorers_walkforward, load_game_totals,
     load_td_props,
 )
 
 OUTLIER_THRESHOLDS = (0.02, 0.04, 0.06)
 MIN_BOOKS_FOR_OUTLIER = 3  # need >=2 "others" for a meaningful median-of-others
+
+OU_MARKETS = (
+    "player_receptions", "player_rush_attempts", "player_rush_yds",
+    "player_reception_yds", "player_pass_yds",
+)
 
 
 def build_devigged_props() -> pd.DataFrame:
@@ -236,6 +242,478 @@ def report_layable_no_side(outlier_tables: dict) -> None:
             print(above[has_no].groupby("book").size().sort_values(ascending=False).to_string())
 
 
+## ---------------------------------------------------------------------
+## Over/Under markets: player_receptions, player_rush_attempts,
+## player_rush_yds, player_reception_yds, player_pass_yds.
+##
+## These are two-sided (Over/Under) rather than a Yes/No field, and books
+## also disagree on the LINE itself, not just the price at a shared line.
+## Books frequently offer several alternate lines for the same player —
+## ~9% of (market, game, player, book) combos have more than one distinct
+## line. To keep "line disagreement between books" separate from "how
+## many alt lines a book happens to list", most of what follows works off
+## each book's PRIMARY line: among lines where that book quotes BOTH
+## Over and Under, the one closest to the across-book median line for
+## that player/game. Outlier and ROI analysis go one step further and
+## restrict to (game, player, line) triples where >=3 books quote the
+## IDENTICAL line — comparing de-vigged probabilities only makes sense
+## when books are pricing the same bet.
+## ---------------------------------------------------------------------
+
+
+def load_ou_props() -> pd.DataFrame:
+    """All five O/U markets, Over/Under sides, QB/RB/WR/TE, with
+    game_id/season/week joined in and p_raw = 1/price. Scratches
+    (via snap_counts, same definition as the anytime-TD market) are
+    excluded here so they never enter any downstream O/U analysis."""
+    props = pd.read_parquet(PROPS_PATH)
+    ou = props[
+        props.market.isin(OU_MARKETS)
+        & props.side.isin(["Over", "Under"])
+        & props.position.isin(SKILL_POSITIONS)
+        & props.player_id.notna()
+    ].copy()
+
+    idx = pd.read_parquet(EVENT_INDEX_PATH)[["event_id", "game_id", "season", "week", "home_team", "away_team"]]
+    ou = ou.merge(idx, on="event_id", how="inner")
+    ou["p_raw"] = 1.0 / ou["price"]
+
+    ou = ou[~compute_is_scratch(ou)].reset_index(drop=True)
+    return ou
+
+
+def report_ou_coverage(ou: pd.DataFrame) -> None:
+    print("\n" + "=" * 70)
+    print("PART 7 — Coverage: five Over/Under markets (all lines, all books, non-scratch)")
+    print("=" * 70)
+    for market in OU_MARKETS:
+        sub = ou[ou.market == market]
+        n_pairs = sub.groupby(["game_id", "player_id"]).ngroups
+        print(f"\n--- {market} ---")
+        print(f"  overall: rows={len(sub)}  (game,player) pairs={n_pairs}  books={sub.book.nunique()}")
+        rows = []
+        for season, s in sub.groupby("season"):
+            rows.append({
+                "season": season, "n_rows": len(s),
+                "n_game_player": s.groupby(["game_id", "player_id"]).ngroups,
+                "n_books": s.book.nunique(),
+            })
+        print(pd.DataFrame(rows).set_index("season").to_string())
+
+
+def select_primary_lines(ou: pd.DataFrame) -> pd.DataFrame:
+    """One row per (market, game_id, player_id, book, side): each book's
+    main line only. See module docstring for why (alt lines)."""
+    key_cols = ["market", "game_id", "player_id", "book", "line"]
+    ou = ou.copy()
+    ou["_key"] = list(zip(*(ou[c] for c in key_cols)))
+
+    sides = ou.groupby("_key")["side"].apply(lambda s: frozenset(s))
+    twoway_keys = set(sides[sides == frozenset({"Over", "Under"})].index)
+    twoway = ou[ou["_key"].isin(twoway_keys)]
+
+    book_lines = twoway.drop_duplicates("_key")
+    median_line = book_lines.groupby(["market", "game_id", "player_id"])["line"].median().rename("median_line")
+    book_lines = book_lines.merge(median_line, on=["market", "game_id", "player_id"])
+    book_lines["dist"] = (book_lines["line"] - book_lines["median_line"]).abs()
+    primary = book_lines.sort_values("dist").drop_duplicates(
+        ["market", "game_id", "player_id", "book"], keep="first")
+
+    result = twoway[twoway["_key"].isin(set(primary["_key"]))]
+    return result.drop(columns="_key")
+
+
+def report_line_disagreement(primary: pd.DataFrame) -> None:
+    print("\n" + "=" * 70)
+    print("PART 8 — Line disagreement: max-min LINE across books, per (game, player), primary lines only")
+    print("=" * 70)
+    book_lines = primary.drop_duplicates(["market", "game_id", "player_id", "book"])
+    for market in OU_MARKETS:
+        sub = book_lines[book_lines.market == market]
+        grp = sub.groupby(["game_id", "player_id"])["line"]
+        n_books = grp.size()
+        spread = grp.max() - grp.min()
+        multi = spread[n_books >= 2]
+        print(f"\n--- {market} (n={len(multi)} pairs with >=2 books) ---")
+        if multi.empty:
+            print("  no pairs with >=2 books")
+            continue
+        pct_disagree = (multi > 0).mean() * 100
+        print(f"  {pct_disagree:.1f}% of pairs show ANY line disagreement across books")
+        print(multi.describe(percentiles=[0.5, 0.75, 0.9, 0.95, 0.99]).to_string())
+
+
+def compute_same_line_wide(ou: pd.DataFrame) -> pd.DataFrame:
+    """One row per (market, game_id, player_id, line, book, season),
+    restricted to (market, game_id, player_id, line) triples where
+    >=MIN_BOOKS_FOR_OUTLIER books quote that EXACT line (both sides).
+    Columns price_Over/price_Under/p_raw_Over/p_raw_Under plus
+    p_over_devig (proportional de-vig: p_raw_Over / (p_raw_Over +
+    p_raw_Under))."""
+    key_cols = ["market", "game_id", "player_id", "book", "line"]
+    ou = ou.copy()
+    ou["_bkey"] = list(zip(*(ou[c] for c in key_cols)))
+    sides = ou.groupby("_bkey")["side"].apply(lambda s: frozenset(s))
+    twoway_bkeys = set(sides[sides == frozenset({"Over", "Under"})].index)
+    two_way = ou[ou["_bkey"].isin(twoway_bkeys)]
+
+    wide = two_way.pivot_table(
+        index=["market", "game_id", "player_id", "line", "book", "season"],
+        columns="side", values=["price", "p_raw"], aggfunc="first",
+    )
+    wide.columns = [f"{val}_{side}" for val, side in wide.columns]
+    wide = wide.reset_index()
+    wide["p_over_devig"] = wide["p_raw_Over"] / (wide["p_raw_Over"] + wide["p_raw_Under"])
+
+    n_books = wide.groupby(["market", "game_id", "player_id", "line"])["book"].transform("nunique")
+    return wide[n_books >= MIN_BOOKS_FOR_OUTLIER].reset_index(drop=True)
+
+
+def report_same_line_spread(same_line: pd.DataFrame) -> None:
+    print("\n" + "=" * 70)
+    print(f"PART 9 — Same-line proportional de-vig spread (Over probability), "
+          f"restricted to (game,player,line) triples with >={MIN_BOOKS_FOR_OUTLIER} books on the identical line")
+    print("=" * 70)
+    for market in OU_MARKETS:
+        sub = same_line[same_line.market == market]
+        grp = sub.groupby(["game_id", "player_id", "line"])["p_over_devig"]
+        n_triples = grp.ngroups
+        print(f"\n--- {market}: {n_triples} surviving (game,player,line) triples ---")
+        if n_triples == 0:
+            print("  none survive — same-line sample is empty for this market")
+            continue
+        if n_triples < 30:
+            print(f"  WARNING: only {n_triples} triples — same-line sample is tiny, treat with caution")
+        spread = grp.max() - grp.min()
+        print(spread.describe(percentiles=[0.5, 0.75, 0.9, 0.95, 0.99]).to_string())
+
+
+def compute_actual_ou_stats(seasons=ACTUAL_SCORER_SEASONS) -> dict:
+    """{market: DataFrame[game_id, player_id, actual]} ground truth from
+    play-by-play. Two-point plays excluded (same convention as the rest
+    of this project). A (game_id, player_id) with no qualifying pbp rows
+    at all (e.g. zero receptions) simply won't appear here — callers must
+    left-join and fillna(0), not treat a missing row as unknown."""
+    cols = ["season", "game_id", "complete_pass", "receiving_yards", "receiver_player_id",
+            "rush_attempt", "rushing_yards", "rusher_player_id",
+            "pass_attempt", "passing_yards", "passer_player_id", "two_point_attempt"]
+    pbp = pd.read_parquet(PBP_PATH, columns=cols)
+    pbp = pbp[pbp.season.isin(seasons) & (pbp.two_point_attempt != 1)]
+
+    rec = pbp[(pbp.complete_pass == 1) & pbp.receiver_player_id.notna()]
+    receptions = rec.groupby(["game_id", "receiver_player_id"]).size().rename("actual").reset_index()
+    receptions = receptions.rename(columns={"receiver_player_id": "player_id"})
+    reception_yds = rec.groupby(["game_id", "receiver_player_id"])["receiving_yards"].sum().rename(
+        "actual").reset_index().rename(columns={"receiver_player_id": "player_id"})
+
+    rush = pbp[(pbp.rush_attempt == 1) & pbp.rusher_player_id.notna()]
+    rush_attempts = rush.groupby(["game_id", "rusher_player_id"]).size().rename("actual").reset_index()
+    rush_attempts = rush_attempts.rename(columns={"rusher_player_id": "player_id"})
+    rush_yds = rush.groupby(["game_id", "rusher_player_id"])["rushing_yards"].sum().rename(
+        "actual").reset_index().rename(columns={"rusher_player_id": "player_id"})
+
+    passed = pbp[(pbp.pass_attempt == 1) & pbp.passer_player_id.notna()]
+    pass_yds = passed.groupby(["game_id", "passer_player_id"])["passing_yards"].sum().rename(
+        "actual").reset_index().rename(columns={"passer_player_id": "player_id"})
+
+    return {
+        "player_receptions": receptions,
+        "player_reception_yds": reception_yds,
+        "player_rush_attempts": rush_attempts,
+        "player_rush_yds": rush_yds,
+        "player_pass_yds": pass_yds,
+    }
+
+
+def compute_ou_outlier_table(same_line: pd.DataFrame, threshold: float) -> pd.DataFrame:
+    """One row per (market, game_id, player_id, line, book) where that
+    book's proportionally-de-vigged Over probability differs from the
+    leave-one-out median of its peers (on the same line) by more than
+    `threshold`. bettable_side='Over' when the book's Over price is the
+    generous one (p_over_devig below peer median); bettable_side='Under'
+    when the book's Under price is the generous one — which is exactly
+    the case where p_over_devig sits ABOVE the peer median, since
+    p_under_devig = 1 - p_over_devig and the median is equivariant under
+    that reflection (median(1-x) = 1-median(x)), so no separate Under-
+    side pass is needed."""
+    rows = []
+    for (market, game_id, player_id, line), g in same_line.groupby(["market", "game_id", "player_id", "line"]):
+        values = g["p_over_devig"].to_numpy()
+        books = g["book"].to_numpy()
+        season = g["season"].iloc[0]
+        price_over = g["price_Over"].to_numpy()
+        praw_over = g["p_raw_Over"].to_numpy()
+        price_under = g["price_Under"].to_numpy()
+        praw_under = g["p_raw_Under"].to_numpy()
+
+        for i in range(len(values)):
+            med_others = np.median(np.delete(values, i))
+            diff = values[i] - med_others
+            if abs(diff) <= threshold:
+                continue
+            if diff < 0:
+                side, price, p_raw = "Over", price_over[i], praw_over[i]
+            else:
+                side, price, p_raw = "Under", price_under[i], praw_under[i]
+            rows.append({
+                "market": market, "game_id": game_id, "player_id": player_id, "line": line,
+                "book": books[i], "season": season, "bettable_side": side,
+                "price": price, "p_raw": p_raw,
+            })
+    return pd.DataFrame(rows)
+
+
+def attach_ou_outcomes(outliers: pd.DataFrame, actual_stats: dict) -> pd.DataFrame:
+    """Joins actual stat value, tags each row win/loss/push (push = actual
+    exactly equals the line — a void, excluded from hit-rate/ROI)."""
+    parts = []
+    for market, sub in outliers.groupby("market"):
+        merged = sub.merge(actual_stats[market], on=["game_id", "player_id"], how="left")
+        merged["actual"] = merged["actual"].fillna(0.0)
+        parts.append(merged)
+    df = pd.concat(parts, ignore_index=True) if parts else outliers.assign(actual=pd.Series(dtype=float))
+
+    conditions = [
+        df["actual"] == df["line"],
+        (df["bettable_side"] == "Over") & (df["actual"] > df["line"]),
+        (df["bettable_side"] == "Under") & (df["actual"] < df["line"]),
+    ]
+    df["outcome"] = np.select(conditions, ["push", "win", "win"], default="loss")
+    df["profit"] = np.where(df.outcome == "push", np.nan,
+                             np.where(df.outcome == "win", df["price"] - 1.0, -1.0))
+    df["hit"] = np.where(df.outcome == "push", np.nan, (df.outcome == "win").astype(float))
+    return df
+
+
+def report_ou_outlier_counts(same_line: pd.DataFrame, ou_outlier_tables: dict) -> None:
+    print("\n" + "=" * 70)
+    print(f"PART 10a — O/U outlier counts, min {MIN_BOOKS_FOR_OUTLIER} books on the identical line")
+    print("=" * 70)
+    n_eligible_rows = len(same_line)
+    print(f"Eligible book-level rows (same line, >={MIN_BOOKS_FOR_OUTLIER} books): {n_eligible_rows}")
+    for threshold in OUTLIER_THRESHOLDS:
+        n = len(ou_outlier_tables[threshold])
+        pct = n / n_eligible_rows * 100 if n_eligible_rows else float("nan")
+        print(f"  X={threshold * 100:.0f}pp: {n} outlier cases ({pct:.2f}% of eligible rows)")
+
+
+def _summarize(df: pd.DataFrame) -> dict:
+    decided = df[df.outcome != "push"]
+    return {
+        "n": len(df), "n_push": int((df.outcome == "push").sum()),
+        "n_decided": len(decided),
+        "hit_rate": decided["hit"].mean() if len(decided) else float("nan"),
+        "raw_implied_p": decided["p_raw"].mean() if len(decided) else float("nan"),
+        "roi_pct": decided["profit"].mean() * 100 if len(decided) else float("nan"),
+    }
+
+
+def report_ou_bettable_side(outcomes: dict) -> None:
+    """outcomes: {threshold: DataFrame} — output of attach_ou_outcomes,
+    already restricted to outlier cases (both directions bettable)."""
+    print("\n" + "=" * 70)
+    print("PART 10b — O/U outliers, both directions bettable: hit rate vs raw (vig-inclusive) "
+          "implied probability and ROI at the outlier book's own price. Pushes excluded from "
+          "hit rate/ROI, reported separately.")
+    print("=" * 70)
+
+    for threshold in OUTLIER_THRESHOLDS:
+        df = outcomes[threshold]
+        print(f"\n--- X = {threshold * 100:.0f}pp (n={len(df)}) ---")
+        if df.empty:
+            print("  no outlier cases at this threshold")
+            continue
+
+        pooled = _summarize(df)
+        print(f"  POOLED: n={pooled['n']}  n_push={pooled['n_push']}  n_decided={pooled['n_decided']}  "
+              f"hit_rate={pooled['hit_rate']:.3f}  raw_implied_p={pooled['raw_implied_p']:.3f}  "
+              f"ROI={pooled['roi_pct']:+.2f}%")
+
+        for label, key in (("market", "market"), ("book", "book"), ("season", "season"), ("side", "bettable_side")):
+            print(f"\n  By {label}:")
+            rows = []
+            for val, sub in df.groupby(key):
+                s = _summarize(sub)
+                rows.append({label: val, **s})
+            table = pd.DataFrame(rows).set_index(label).sort_values("n", ascending=False)
+            print(table.to_string())
+
+
+def report_ou_pushes_and_scratches(ou: pd.DataFrame, outcomes: dict) -> None:
+    print("\n" + "=" * 70)
+    print("PART 11 — Push counts per market (among outlier cases) and scratch exclusion recap")
+    print("=" * 70)
+    print("\nScratch exclusion uses the same snap_counts-based definition as the anytime-TD "
+          "market (see props_sanity.py); it was already applied when loading O/U props, "
+          "before any of the above.")
+
+    for threshold in OUTLIER_THRESHOLDS:
+        df = outcomes[threshold]
+        print(f"\n--- X = {threshold * 100:.0f}pp ---")
+        if df.empty:
+            print("  no outlier cases at this threshold")
+            continue
+        rows = []
+        for market, sub in df.groupby("market"):
+            rows.append({
+                "market": market, "n": len(sub), "n_push": int((sub.outcome == "push").sum()),
+                "push_rate": (sub.outcome == "push").mean(),
+            })
+        print(pd.DataFrame(rows).set_index("market").to_string())
+
+
+def run_ou_markets() -> dict:
+    ou = load_ou_props()
+    print(f"\nNon-scratch O/U prop rows across 5 markets: {len(ou)}")
+
+    report_ou_coverage(ou)
+
+    primary = select_primary_lines(ou)
+    report_line_disagreement(primary)
+
+    same_line = compute_same_line_wide(ou)
+    report_same_line_spread(same_line)
+
+    ou_outlier_tables = {t: compute_ou_outlier_table(same_line, t) for t in OUTLIER_THRESHOLDS}
+    report_ou_outlier_counts(same_line, ou_outlier_tables)
+
+    actual_stats = compute_actual_ou_stats()
+    outcomes = {t: attach_ou_outcomes(ou_outlier_tables[t], actual_stats) for t in OUTLIER_THRESHOLDS}
+    report_ou_bettable_side(outcomes)
+    report_ou_pushes_and_scratches(ou, outcomes)
+
+    return {"ou": ou, "same_line": same_line, "actual_stats": actual_stats, "outcomes": outcomes}
+
+
+## ---------------------------------------------------------------------
+## Under/Over robustness deep-dive: is the Under-side edge found above
+## real, or does it evaporate under a season/market/bootstrap breakdown?
+## ---------------------------------------------------------------------
+
+
+def bootstrap_roi(profits: np.ndarray, n_resamples: int = 10_000, seed: int = 0) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    n = len(profits)
+    means = np.empty(n_resamples)
+    for i in range(n_resamples):
+        idx = rng.integers(0, n, size=n)
+        means[i] = profits[idx].mean()
+    return means
+
+
+def report_side_robustness(outcomes: dict, side: str) -> dict:
+    """Season and market breakdown of ROI for one bettable side's outlier
+    cases, at each threshold. Returns {threshold: decided-profit array}
+    for the bootstrap step."""
+    print(f"\n--- {side}-side outliers: by season ---")
+    profits_by_threshold = {}
+    for threshold in OUTLIER_THRESHOLDS:
+        df = outcomes[threshold]
+        sub = df[df.bettable_side == side]
+        decided = sub[sub.outcome != "push"]
+        print(f"\nX = {threshold * 100:.0f}pp (n={len(sub)}, n_decided={len(decided)}):")
+        if decided.empty:
+            print("  no decided bets")
+            profits_by_threshold[threshold] = np.array([])
+            continue
+
+        rows = []
+        for season, s in decided.groupby("season"):
+            rows.append({"season": season, "n": len(s), "roi_pct": s.profit.mean() * 100})
+        table = pd.DataFrame(rows).set_index("season")
+        print(table.to_string())
+        all_positive = bool((table["roi_pct"] > 0).all())
+        print(f"  all seasons positive: {all_positive}")
+
+        profits_by_threshold[threshold] = decided["profit"].to_numpy()
+
+    print(f"\n--- {side}-side outliers: by market ---")
+    for threshold in OUTLIER_THRESHOLDS:
+        df = outcomes[threshold]
+        decided = df[(df.bettable_side == side) & (df.outcome != "push")]
+        print(f"\nX = {threshold * 100:.0f}pp:")
+        if decided.empty:
+            print("  no decided bets")
+            continue
+        rows = []
+        for market, s in decided.groupby("market"):
+            rows.append({"market": market, "n": len(s), "roi_pct": s.profit.mean() * 100})
+        print(pd.DataFrame(rows).set_index("market").sort_values("roi_pct", ascending=False).to_string())
+
+    return profits_by_threshold
+
+
+def report_bootstrap(profits_by_threshold: dict, side: str) -> None:
+    print(f"\n--- {side}-side outliers: bootstrap of pooled ROI (10,000 resamples, seed=0) ---")
+    for threshold in OUTLIER_THRESHOLDS:
+        profits = profits_by_threshold[threshold]
+        if len(profits) == 0:
+            print(f"  X={threshold * 100:.0f}pp: no decided bets")
+            continue
+        means = bootstrap_roi(profits) * 100
+        observed = profits.mean() * 100
+        p5, p95 = np.percentile(means, [5, 95])
+        verdict = ("5th pctile is BELOW ZERO — not statistically distinguishable from a "
+                   "losing/breakeven strategy" if p5 < 0 else "5th pctile is ABOVE ZERO")
+        print(f"  X={threshold * 100:.0f}pp: n={len(profits)}  observed ROI={observed:+.2f}%  "
+              f"5th pctile={p5:+.2f}%  95th pctile={p95:+.2f}%  -> {verdict}")
+
+
+def report_under_side_baseline(ou: pd.DataFrame, actual_stats: dict) -> None:
+    """Mean raw (vig-inclusive) implied probability and mean hit rate for
+    EVERY Under quote in the non-scratch dataset (all lines, all books —
+    not just outliers), to check whether underpricing is a market-wide
+    Under-side property or confined to the outlier subset."""
+    print("\n" + "=" * 70)
+    print("Under (and Over, for comparison) side, ALL quotes — not just outliers")
+    print("=" * 70)
+
+    for side in ("Under", "Over"):
+        book_side = ou[ou.side == side]
+        parts = []
+        for market, sub in book_side.groupby("market"):
+            merged = sub.merge(actual_stats[market], on=["game_id", "player_id"], how="left")
+            merged["actual"] = merged["actual"].fillna(0.0)
+            parts.append(merged)
+        df = pd.concat(parts, ignore_index=True)
+
+        if side == "Under":
+            outcome = np.where(df.actual == df.line, "push", np.where(df.actual < df.line, "win", "loss"))
+        else:
+            outcome = np.where(df.actual == df.line, "push", np.where(df.actual > df.line, "win", "loss"))
+        df["outcome"] = outcome
+        decided = df[df.outcome != "push"]
+
+        print(f"\n{side}: n={len(df)}  n_push={len(df) - len(decided)}  "
+              f"mean_raw_implied_p={decided.p_raw.mean():.3f}  hit_rate={(decided.outcome == 'win').mean():.3f}")
+
+        rows = []
+        for market, s in decided.groupby("market"):
+            rows.append({
+                "market": market, "n": len(s), "mean_raw_implied_p": s.p_raw.mean(),
+                "hit_rate": (s.outcome == "win").mean(),
+            })
+        print(pd.DataFrame(rows).set_index("market").to_string())
+
+
+def run_under_over_deep_dive(ou_results: dict) -> None:
+    outcomes = ou_results["outcomes"]
+
+    print("\n" + "=" * 70)
+    print("DEEP DIVE — Under-side outliers: season/market robustness + bootstrap")
+    print("=" * 70)
+    under_profits = report_side_robustness(outcomes, "Under")
+    report_bootstrap(under_profits, "Under")
+
+    print("\n" + "=" * 70)
+    print("DEEP DIVE — Over-side outliers (mirror check): season/market robustness + bootstrap")
+    print("=" * 70)
+    over_profits = report_side_robustness(outcomes, "Over")
+    report_bootstrap(over_profits, "Over")
+
+    report_under_side_baseline(ou_results["ou"], ou_results["actual_stats"])
+
+
 def main() -> None:
     df = build_devigged_props()
     print(f"Non-scratch anytime-TD prop rows: {len(df)}")
@@ -248,6 +726,9 @@ def main() -> None:
     report_by_book(df, outlier_tables)
     report_bettable_side(outlier_tables)
     report_layable_no_side(outlier_tables)
+
+    ou_results = run_ou_markets()
+    run_under_over_deep_dive(ou_results)
 
 
 if __name__ == "__main__":
