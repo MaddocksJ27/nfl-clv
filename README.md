@@ -1,4 +1,3 @@
-[README (1).md](https://github.com/user-attachments/files/31524092/README.1.md)
 # NFL Betting Market Efficiency
 
 An empirical study of where NFL betting markets are efficient and where they are not, using six seasons of line history and three seasons of player prop prices.
