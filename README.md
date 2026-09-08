@@ -4,6 +4,9 @@ An empirical study of where NFL betting markets are efficient and where they are
 
 The project started as an attempt to build a profitable model. It became a study of *why that is hard*, with each hypothesis tested and reported regardless of outcome. Every result below is out-of-sample.
 
+![Detection power vs. sample size](figures/power_curve.png)
+*At this study's sample size (n=734), a real 53-55% edge would very likely go undetected — the sample is underpowered, not the finding disproven.*
+
 ---
 
 ## Summary of findings
@@ -88,7 +91,13 @@ The naive definition — last observed price minus first observed price — is c
 
 That trend was an artefact. A line posted eight weeks out moves mainly because *the teams play games in between* — that is team-strength revision, not pre-kickoff information flow.
 
+![Drift distribution under three horizon definitions](figures/drift_definitions.png)
+*The loose first-observed definition collapses to a far tighter, stable distribution once the horizon is fixed — SD drops from 3.22 to 0.96 points.*
+
 Re-anchoring to a fixed 3-day horizon gives a stable quantity:
+
+![Perfect-foresight ROI ceiling by horizon](figures/foresight_ceiling.png)
+*Even with hindsight of which way the closing line moves, the ROI ceiling from acting on it shrinks toward zero as the horizon approaches kickoff.*
 
 | Horizon | n | Drift SD | Season range |
 |---|---|---|---|
@@ -138,6 +147,9 @@ with `E[distinct scorers]` fit walk-forward from the game total. Estimated margi
 ### Calibration
 
 After correct de-vigging, market prices are well calibrated across all deciles and all four positions:
+
+![Anytime-TD calibration by decile](figures/td_calibration.png)
+*Predicted vs. actual hit rate hugs the 45° line at every decile, pooled and separately for each position.*
 
 | Decile | Predicted | Actual |
 |---|---|---|
@@ -196,6 +208,9 @@ If books set lines at the conditional *mean*, skew alone would push Under hit ra
 | Passing yards | 0.498 | 0.497 |
 
 Consensus lines track the conditional median closely and sit well below the conditional mean. **Books have already absorbed the skew.** The near-symmetric passing-yards market acts as a natural control, showing no gap — exactly as the explanation predicts.
+
+![Consensus line vs. conditional mean and median, by market](figures/prop_skew.png)
+*Lines track the conditional median far more closely than the mean in four markets; passing yards, the near-symmetric control, shows mean, median, and line nearly coincide.*
 
 ### The Under "edge" is line shopping, not mispricing
 

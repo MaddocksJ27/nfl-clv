@@ -66,7 +66,7 @@ def list_historical_events(snapshot_iso: str):
     return payload
 
 
-def fetch_event_props(event_id: str, snapshot_iso: str, regions: str):
+def fetch_event_props(event_id: str, snapshot_iso: str, regions: str, markets: str = "player_anytime_td"):
     """GET /historical/sports/{sport}/events/{event_id}/odds — one request."""
     url = f"{BASE_URL}/historical/sports/{SPORT_KEY}/events/{event_id}/odds"
     resp = requests.get(
@@ -75,7 +75,7 @@ def fetch_event_props(event_id: str, snapshot_iso: str, regions: str):
             "apiKey": API_KEY,
             "date": snapshot_iso,
             "regions": regions,
-            "markets": "player_anytime_td",
+            "markets": markets,
             "oddsFormat": "decimal",
         },
         timeout=REQUEST_TIMEOUT,
