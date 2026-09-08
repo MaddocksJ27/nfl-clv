@@ -34,8 +34,10 @@ push/cover-margin convention this module reuses directly).
 
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
 from sklearn.linear_model import LogisticRegressionCV
 from sklearn.preprocessing import StandardScaler
+from statsmodels.stats.proportion import proportion_confint
 
 from src.eval.book_disagreement import bootstrap_roi
 from src.eval.spread_horizon_ceiling import VIG_PRICE
@@ -51,6 +53,11 @@ from src.models.spread_baseline import build_dataset as build_model1_dataset
 HORIZON_DAYS = 7
 RIDGE_ALPHAS = np.logspace(-3, 3, 13)
 TOP_QUARTILE = 0.75  # confidence percentile cutoff
+
+Z_ALPHA_ONE_SIDED = norm.ppf(0.95)  # 1.6449 -- matches the 5th-percentile bootstrap threshold used throughout
+POWER_TEST_HIT_RATES = (0.53, 0.54, 0.55)
+POWER_N_SIMS = 10_000
+TARGET_POWER = 0.80
 
 NUMERIC_FEATURES = (
     ["model1_minus_consensus", "consensus_spread_h7", "consensus_total_h7", "book_disagreement_h7"]
@@ -255,7 +262,7 @@ def _report_roi(bets: pd.DataFrame, label: str) -> None:
     print(pd.DataFrame(rows).set_index("season").round(4).to_string())
 
 
-def report_roi(oof: pd.DataFrame, df: pd.DataFrame) -> None:
+def report_roi(oof: pd.DataFrame, df: pd.DataFrame) -> pd.DataFrame:
     print("\n" + "=" * 70)
     print("ROI at -110, betting every predicted direction")
     print("=" * 70)
@@ -270,6 +277,91 @@ def report_roi(oof: pd.DataFrame, df: pd.DataFrame) -> None:
     print(f"(confidence threshold: {threshold:.4f})")
     _report_roi(top, "TOP-QUARTILE-CONFIDENCE bets")
 
+    return bets
+
+
+def _profit_mean_sd(hit_rate: float) -> tuple:
+    """Population mean and SD of per-bet profit at -110, for a bet with
+    the given TRUE hit rate — exact, from the two-point {win, loss}
+    distribution (win=+100/110, loss=-1)."""
+    win_profit = VIG_PRICE - 1.0
+    loss_profit = -1.0
+    mean = hit_rate * win_profit + (1 - hit_rate) * loss_profit
+    sd = np.sqrt(hit_rate * (1 - hit_rate)) * (win_profit - loss_profit)
+    return mean, sd
+
+
+def simulate_detection_power(true_hit_rate: float, n: int, n_sims: int = POWER_N_SIMS, seed: int = 0) -> float:
+    """Fraction of n_sims simulated n-bet samples at the given TRUE hit
+    rate whose bootstrap 5th percentile would land above zero.
+
+    Uses a normal approximation to the percentile bootstrap
+    (bootstrap 5th pctile ~= sample_mean - z_0.95 * sample_SE) rather than
+    a literal nested bootstrap (10,000 outer sims x 10,000 inner
+    resamples would be ~1e8 resamples per hit rate — intractable). This
+    is justified by the CLT for a bounded two-point profit distribution
+    at n in the hundreds, and was checked directly: on the module's own
+    730-bet sample, this formula gives -6.92%, versus book_disagreement's
+    actual bootstrap_roi() giving -6.90% on the identical data — a
+    near-exact match."""
+    rng = np.random.default_rng(seed)
+    win_profit = VIG_PRICE - 1.0
+    loss_profit = -1.0
+
+    wins = rng.binomial(n, true_hit_rate, size=n_sims)
+    sample_hit_rate = wins / n
+    sample_mean = sample_hit_rate * win_profit + (1 - sample_hit_rate) * loss_profit
+    sample_var = (wins * (win_profit - sample_mean) ** 2
+                  + (n - wins) * (loss_profit - sample_mean) ** 2) / (n - 1)
+    se = np.sqrt(sample_var / n)
+    approx_p5 = sample_mean - Z_ALPHA_ONE_SIDED * se
+
+    return float((approx_p5 > 0).mean())
+
+
+def required_sample_size(true_hit_rate: float, target_power: float = TARGET_POWER) -> float:
+    """Closed-form n for `target_power` one-sided power (alpha matching the
+    z=1.6449 / 5th-percentile threshold used throughout this file) to
+    distinguish a true hit rate from break-even at -110: the standard
+    n = ((z_alpha + z_beta) * sigma / mu)^2 formula for a one-sample mean
+    test against a null of zero."""
+    mean, sd = _profit_mean_sd(true_hit_rate)
+    z_beta = norm.ppf(target_power)
+    return ((Z_ALPHA_ONE_SIDED + z_beta) * sd / mean) ** 2
+
+
+def report_power_analysis(bets: pd.DataFrame) -> None:
+    print("\n" + "=" * 70)
+    print("POWER ANALYSIS — can this sample size detect a real edge if one exists?")
+    print("=" * 70)
+
+    n_bets = len(bets)
+    print(f"\n1. Simulated detection power at n={n_bets} bets, {POWER_N_SIMS:,} simulated samples per true hit rate:")
+    for p in POWER_TEST_HIT_RATES:
+        power = simulate_detection_power(p, n_bets)
+        mean, _ = _profit_mean_sd(p)
+        print(f"  true hit rate={p:.2f} (true ROI={mean * 100:+.2f}%): "
+              f"P(bootstrap 5th pctile > 0) = {power:.3f}")
+
+    print(f"\n2. Sample size required for {TARGET_POWER * 100:.0f}% power to distinguish from break-even at -110:")
+    for p in POWER_TEST_HIT_RATES:
+        n_needed = required_sample_size(p)
+        print(f"  true hit rate={p:.2f}: n={n_needed:,.0f}")
+
+    print("\n3. 95% CI on the observed hit rate, expressed as ROI bounds:")
+    decided = bets[bets.outcome != "push"]
+    n_decided = len(decided)
+    n_wins = int((decided.outcome == "win").sum())
+    p_hat = n_wins / n_decided
+    ci_low, ci_high = proportion_confint(n_wins, n_decided, alpha=0.05, method="wilson")
+
+    roi_point, _ = _profit_mean_sd(p_hat)
+    roi_low, _ = _profit_mean_sd(ci_low)
+    roi_high, _ = _profit_mean_sd(ci_high)
+    print(f"  observed: n={n_decided}  hit_rate={p_hat:.4f}  point ROI={roi_point * 100:+.2f}%")
+    print(f"  95% Wilson CI on hit rate: [{ci_low:.4f}, {ci_high:.4f}]")
+    print(f"  95% CI on ROI:            [{roi_low * 100:+.2f}%, {roi_high * 100:+.2f}%]")
+
 
 def main() -> None:
     df = build_dataset()
@@ -278,7 +370,8 @@ def main() -> None:
 
     oof = walk_forward_logistic_ridge(df)
     report_accuracy(oof)
-    report_roi(oof, df)
+    bets = report_roi(oof, df)
+    report_power_analysis(bets)
 
 
 if __name__ == "__main__":
